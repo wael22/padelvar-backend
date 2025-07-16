@@ -1,7 +1,9 @@
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
-from models.user import db, User, UserRole
+from src.models.user import User, UserRole # Assurez-vous que UserRole est défini dans user.py
+from src.models.database import db
 import re
+import traceback
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -61,6 +63,8 @@ def register():
         
     except Exception as e:
         db.session.rollback()
+        print(f"Erreur lors de l'inscription: {e}")
+        traceback.print_exc()
         return jsonify({'error': 'Erreur lors de l\'inscription'}), 500
 
 @auth_bp.route('/login', methods=['POST'])
@@ -90,6 +94,8 @@ def login():
         }), 200
         
     except Exception as e:
+        print(f"Erreur lors de la connexion: {e}")
+        traceback.print_exc()
         return jsonify({'error': 'Erreur lors de la connexion'}), 500
 
 @auth_bp.route('/logout', methods=['POST'])
@@ -112,6 +118,8 @@ def get_current_user():
         return jsonify({'user': user.to_dict()}), 200
         
     except Exception as e:
+        print(f"Erreur lors de la récupération de l'utilisateur: {e}")
+        traceback.print_exc()
         return jsonify({'error': 'Erreur lors de la récupération de l\'utilisateur'}), 500
 
 @auth_bp.route('/update-profile', methods=['PUT'])
@@ -144,5 +152,6 @@ def update_profile():
         
     except Exception as e:
         db.session.rollback()
+        print(f"Erreur lors de la mise à jour du profil: {e}")
+        traceback.print_exc()
         return jsonify({'error': 'Erreur lors de la mise à jour du profil'}), 500
-

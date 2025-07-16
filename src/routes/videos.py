@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, session
-from models.user import db, User, Video, Court, UserRole
+from src.models.user import db, User, Video, Court, UserRole
 from datetime import datetime
 import os
 
@@ -335,4 +335,3 @@ def get_camera_stream(court_id):
         
     except Exception as e:
         return jsonify({'error': 'Erreur lors de la récupération du flux caméra'}), 500
-
