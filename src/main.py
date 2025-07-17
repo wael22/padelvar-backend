@@ -2,6 +2,7 @@ import os
 from flask import Flask
 from flask_cors import CORS
 from flask_migrate import Migrate
+from datetime import timedelta
 
 # 1. Importer l'instance db centralisée
 from src.models.database import db
@@ -28,11 +29,24 @@ def create_app():
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'database', 'app.db')
     app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{db_path}"
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    
+    # Configuration des sessions
+    app.config['SESSION_COOKIE_SECURE'] = False  # True en production avec HTTPS
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # Permet les requêtes cross-origin
+    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)  # Session de 24h
+    app.config['SESSION_COOKIE_NAME'] = 'padelvar_session'
 
     # 3. Initialiser les extensions avec l'application
     db.init_app(app)
     Migrate(app, db)
-    CORS(app, origins=["http://localhost:5173", "*"], supports_credentials=True)
+    
+    # Configuration CORS corrigée
+    CORS(app, 
+         origins=["http://localhost:5173", "http://127.0.0.1:5173"], 
+         supports_credentials=True,
+         allow_headers=["Content-Type", "Authorization"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
     # 4. Enregistrer les Blueprints
     app.register_blueprint(auth_bp, url_prefix='/api/auth')

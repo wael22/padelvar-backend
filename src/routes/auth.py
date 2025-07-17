@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, request, jsonify, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 from src.models.user import User, UserRole # Assurez-vous que UserRole est défini dans user.py
 from src.models.database import db
@@ -52,14 +52,19 @@ def register():
         db.session.add(new_user)
         db.session.commit()
         
-        # Créer une session
+        # Créer une session permanente
+        session.permanent = True
         session['user_id'] = new_user.id
         session['user_role'] = new_user.role.value
         
-        return jsonify({
+        print(f"Session créée pour l'utilisateur {new_user.id}: {dict(session)}")
+        
+        response = make_response(jsonify({
             'message': 'Inscription réussie',
             'user': new_user.to_dict()
-        }), 201
+        }), 201)
+        
+        return response
         
     except Exception as e:
         db.session.rollback()
@@ -84,14 +89,19 @@ def login():
         if not user or not user.password_hash or not check_password_hash(user.password_hash, password):
             return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
         
-        # Créer une session
+        # Créer une session permanente
+        session.permanent = True
         session['user_id'] = user.id
         session['user_role'] = user.role.value
         
-        return jsonify({
+        print(f"Session créée pour l'utilisateur {user.id}: {dict(session)}")
+        
+        response = make_response(jsonify({
             'message': 'Connexion réussie',
             'user': user.to_dict()
-        }), 200
+        }), 200)
+        
+        return response
         
     except Exception as e:
         print(f"Erreur lors de la connexion: {e}")
@@ -100,21 +110,27 @@ def login():
 
 @auth_bp.route('/logout', methods=['POST'])
 def logout():
+    print(f"Déconnexion de l'utilisateur: {session.get('user_id')}")
     session.clear()
-    return jsonify({'message': 'Déconnexion réussie'}), 200
+    response = make_response(jsonify({'message': 'Déconnexion réussie'}), 200)
+    return response
 
 @auth_bp.route('/me', methods=['GET'])
 def get_current_user():
     try:
-        user_id = session.get('user_id')
+        print(f"Vérification de session dans /me: {dict(session)}")
+        user_id = session.get("user_id")
         if not user_id:
+            print("Aucun user_id dans la session")
             return jsonify({'error': 'Non authentifié'}), 401
         
         user = User.query.get(user_id)
         if not user:
+            print(f"Utilisateur {user_id} non trouvé en base")
             session.clear()
             return jsonify({'error': 'Utilisateur non trouvé'}), 404
         
+        print(f"Utilisateur trouvé: {user.email}")
         return jsonify({'user': user.to_dict()}), 200
         
     except Exception as e:

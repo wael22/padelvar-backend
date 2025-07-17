@@ -15,5 +15,3 @@ app = create_app()
 # Ce bloc ne s'exécutera que lorsque vous lancez "python app.py"
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
-
-
