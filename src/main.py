@@ -1,65 +1,190 @@
+"""
+Fichier principal de l'application PadelVar
+Factory pattern pour créer l'instance Flask
+"""
 import os
 from flask import Flask
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash
 from flask_migrate import Migrate
-from datetime import timedelta
 
-# 1. Importer l'instance db centralisée
-from src.models.database import db
+# Importations relatives corrigées
+from .config import config
+from .models.database import db
+from .models.user import User, UserRole
+from .routes.auth import auth_bp
+from .routes.admin import admin_bp
+from .routes.videos import videos_bp
+from .routes.clubs import clubs_bp
+from .routes.frontend import frontend_bp
+from .routes.all_clubs import all_clubs_bp
+from .routes.players import players_bp
 
-# 2. Importer tous vos blueprints avec le chemin complet depuis src
-from src.routes.auth import auth_bp
-from src.routes.admin import admin_bp
-from src.routes.videos import videos_bp
-from src.routes.clubs import clubs_bp
-from src.routes.frontend import frontend_bp
-from src.routes.all_clubs import all_clubs_bp
-from src.routes.players import players_bp
-
-def create_app():
-    """Crée et configure l'instance de l'application Flask."""
+def create_app(config_name=None):
+    """
+    Factory pour créer l'application Flask
+    
+    Args:
+        config_name (str): Nom de la configuration à utiliser ('development', 'production', 'testing')
+                          Par défaut, utilise la variable d'environnement FLASK_ENV ou 'development'
+    
+    Returns:
+        Flask: Instance de l'application configurée
+    """
+    
+    # Déterminer la configuration à utiliser
+    if config_name is None:
+        config_name = os.environ.get('FLASK_ENV', 'development')
+    
+    # Créer l'instance Flask
     app = Flask(
         __name__,
-        static_folder=os.path.join(os.path.dirname(__file__), 'static')
+        static_folder=os.path.join(os.path.dirname(__file__), 'static'),
+        instance_relative_config=True
     )
-
-    # Configuration de l'application
-    app.config['SECRET_KEY'] = 'padelvar_secret_key_2024_secure'
-    # Construit le chemin absolu vers la base de données
-    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'database', 'app.db')
-    app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{db_path}"
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     
-    # Configuration des sessions
-    app.config['SESSION_COOKIE_SECURE'] = False  # True en production avec HTTPS
-    app.config['SESSION_COOKIE_HTTPONLY'] = True
-    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # Permet les requêtes cross-origin
-    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)  # Session de 24h
-    app.config['SESSION_COOKIE_NAME'] = 'padelvar_session'
-
-    # 3. Initialiser les extensions avec l'application
+    # Charger la configuration
+    app.config.from_object(config[config_name])
+    
+    # S'assurer que le dossier instance existe
+    try:
+        os.makedirs(app.instance_path, exist_ok=True)
+    except OSError:
+        pass
+    
+    # Configuration de la base de données avec le chemin correct
+    if config_name != 'testing':
+        app.config['SQLALCHEMY_DATABASE_URI'] = config[config_name].get_database_uri(app)
+    
+    # Validation de la configuration en production
+    if config_name == 'production':
+        config[config_name].validate()
+    
+    # Initialisation des extensions
     db.init_app(app)
-    Migrate(app, db)
+    migrate = Migrate(app, db)
     
-    # Configuration CORS corrigée
+    # Configuration CORS
     CORS(app, 
-         origins=["http://localhost:5173", "http://127.0.0.1:5173"], 
-         supports_credentials=True,
-         allow_headers=["Content-Type", "Authorization"],
-         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-
-    # 4. Enregistrer les Blueprints
+         origins=app.config['CORS_ORIGINS'], 
+         supports_credentials=True)
+    
+    # Enregistrement des blueprints
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(admin_bp, url_prefix='/api/admin')
     app.register_blueprint(videos_bp, url_prefix='/api/videos')
     app.register_blueprint(clubs_bp, url_prefix='/api/clubs')
     app.register_blueprint(frontend_bp)
-    app.register_blueprint(all_clubs_bp, url_prefix='/api/all-clubs') # Changement de préfixe pour éviter conflit
+    app.register_blueprint(all_clubs_bp, url_prefix='/api/all-clubs')
     app.register_blueprint(players_bp, url_prefix='/api/players')
-
-    # Route de santé
+    
+    # Routes de base
     @app.route('/api/health')
     def health_check():
-        return {'status': 'OK', 'message': 'PadelVar API is running'}
-
+        """Point de contrôle de santé de l'API"""
+        return {
+            'status': 'OK', 
+            'message': 'PadelVar API is running',
+            'environment': config_name
+        }
+    
+    @app.route('/')
+    def index():
+        """Page d'accueil de l'API"""
+        return {
+            'message': 'Bienvenue sur l\'API PadelVar',
+            'version': '1.0.0',
+            'endpoints': {
+                'health': '/api/health',
+                'auth': '/api/auth',
+                'admin': '/api/admin',
+                'videos': '/api/videos',
+                'clubs': '/api/clubs',
+                'players': '/api/players'
+            }
+        }
+    
+    # Initialisation de la base de données et création de l'admin
+    # Uniquement en mode développement et si la base n'existe pas
+    if config_name == 'development':
+        with app.app_context():
+            # Créer toutes les tables
+            db.create_all()
+            
+            # Créer l'admin par défaut s'il n'existe pas
+            _create_default_admin(app)
+    
     return app
+
+def _create_default_admin(app):
+    """
+    Crée l'administrateur par défaut s'il n'existe pas
+    
+    Args:
+        app: Instance Flask avec contexte d'application actif
+    """
+    try:
+        admin_email = app.config['DEFAULT_ADMIN_EMAIL']
+        super_admin = User.query.filter_by(email=admin_email).first()
+        
+        if not super_admin:
+            super_admin = User(
+                email=admin_email,
+                password_hash=generate_password_hash(app.config['DEFAULT_ADMIN_PASSWORD']),
+                name=app.config['DEFAULT_ADMIN_NAME'],
+                role=UserRole.SUPER_ADMIN,
+                credits_balance=app.config['DEFAULT_ADMIN_CREDITS']
+            )
+            db.session.add(super_admin)
+            db.session.commit()
+            
+            print(f"✅ Super admin créé: {admin_email} / {app.config['DEFAULT_ADMIN_PASSWORD']}")
+        else:
+            print(f"ℹ️  Super admin existe déjà: {admin_email}")
+            
+    except Exception as e:
+        print(f"❌ Erreur lors de la création de l'admin: {e}")
+        db.session.rollback()
+
+def init_db(app):
+    """
+    Initialise la base de données avec les tables
+    Fonction utilitaire pour les scripts d'initialisation
+    
+    Args:
+        app: Instance Flask
+    """
+    with app.app_context():
+        db.create_all()
+        print("✅ Base de données initialisée")
+
+def create_admin(app, email, password, name="Admin"):
+    """
+    Crée un administrateur
+    Fonction utilitaire pour les scripts d'administration
+    
+    Args:
+        app: Instance Flask
+        email (str): Email de l'administrateur
+        password (str): Mot de passe
+        name (str): Nom de l'administrateur
+    """
+    with app.app_context():
+        existing_admin = User.query.filter_by(email=email).first()
+        if existing_admin:
+            print(f"❌ Un utilisateur avec l'email {email} existe déjà")
+            return False
+        
+        admin = User(
+            email=email,
+            password_hash=generate_password_hash(password),
+            name=name,
+            role=UserRole.SUPER_ADMIN,
+            credits_balance=1000
+        )
+        
+        db.session.add(admin)
+        db.session.commit()
+        print(f"✅ Administrateur créé: {email}")
+        return True
+

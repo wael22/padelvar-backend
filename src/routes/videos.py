@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify, session
-from src.models.user import db, User, Video, Court, UserRole
+# MODIFIÉ : Ajout de Club et Court pour la nouvelle route
+from src.models.user import db, User, Video, Court, Club, UserRole
 from datetime import datetime
 import os
 
@@ -34,26 +35,16 @@ def start_recording():
     try:
         data = request.get_json()
         
-        # Vérifications obligatoires : club et terrain doivent être sélectionnés
-        if not data.get('club_id'):
-            return jsonify({'error': 'Le club doit être sélectionné'}), 400
-        
         if not data.get('court_id'):
             return jsonify({'error': 'Le terrain doit être sélectionné'}), 400
         
-        # Vérifier que le terrain existe et appartient au club
-        court = Court.query.filter_by(id=data['court_id'], club_id=data['club_id']).first()
+        court = Court.query.get(data['court_id'])
         if not court:
-            return jsonify({'error': 'Terrain non trouvé ou ne correspond pas au club sélectionné'}), 400
-        
-        # Pour le MVP, on simule l'enregistrement
-        # Dans une vraie implémentation, on démarrerait l'enregistrement vidéo
+            return jsonify({'error': 'Terrain non trouvé'}), 400
         
         return jsonify({
             'message': 'Enregistrement démarré',
             'recording_id': f"rec_{user.id}_{int(datetime.now().timestamp())}",
-            'court_id': court.id,
-            'club_id': data['club_id']
         }), 200
         
     except Exception as e:
@@ -72,34 +63,27 @@ def stop_recording():
         description = data.get('description', '')
         court_id = data.get('court_id')
         
-        # Vérifier que l'utilisateur a assez de crédits pour l'enregistrement
-        credits_cost = 1  # Coût par enregistrement
+        credits_cost = 1
         if user.credits_balance < credits_cost:
-            return jsonify({'error': 'Crédits insuffisants pour effectuer cet enregistrement'}), 400
+            return jsonify({'error': 'Crédits insuffisants'}), 400
         
-        # Débiter les crédits pour l'enregistrement
         user.credits_balance -= credits_cost
         
         new_video = Video(
-            title=title,
-            description=description,
-            file_url=f'/videos/simulated_{recording_id}.mp4',  # URL simulée
-            thumbnail_url=f'/thumbnails/simulated_{recording_id}.jpg',  # Thumbnail simulée
-            duration=1800,  # 30 minutes par défaut
-            file_size=500000000,  # 500MB par défaut
             user_id=user.id,
             court_id=court_id,
-            is_unlocked=True,  # Vidéo directement accessible après enregistrement
-            credits_cost=0  # Plus de coût pour déverrouiller
+            file_url=f'/videos/simulated_{recording_id}.mp4',
+            is_unlocked=True,
+            title=title,
+            description=description
         )
         
         db.session.add(new_video)
         db.session.commit()
         
         return jsonify({
-            'message': 'Enregistrement terminé et vidéo sauvegardée',
+            'message': 'Vidéo sauvegardée',
             'video': new_video.to_dict(),
-            'remaining_credits': user.credits_balance
         }), 201
         
     except Exception as e:
@@ -300,7 +284,6 @@ def scan_qr_code():
             return jsonify({'error': 'QR code invalide ou terrain non trouvé'}), 404
         
         # Récupérer les informations du club
-        from models.user import Club
         club = Club.query.get(court.club_id)
         
         return jsonify({
@@ -335,3 +318,31 @@ def get_camera_stream(court_id):
         
     except Exception as e:
         return jsonify({'error': 'Erreur lors de la récupération du flux caméra'}), 500
+
+# ====================================================================
+# NOUVELLE ROUTE À AJOUTER À LA FIN DU FICHIER
+# ====================================================================
+@videos_bp.route("/clubs/<int:club_id>/courts", methods=["GET"])
+def get_courts_for_club(club_id):
+    """
+    Route pour récupérer les terrains (courts) d'un club spécifique.
+    Accessible par tout utilisateur connecté.
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Accès non autorisé"}), 401
+
+    try:
+        # Vérifier si le club existe
+        club = Club.query.get(club_id)
+        if not club:
+            return jsonify({"error": "Club non trouvé"}), 404
+
+        # Récupérer tous les terrains pour ce club
+        courts = Court.query.filter_by(club_id=club_id).all()
+        
+        return jsonify({"courts": [court.to_dict() for court in courts]}), 200
+
+    except Exception as e:
+        # logger.error(f"Erreur lors de la récupération des terrains pour le club {club_id}: {e}")
+        return jsonify({"error": "Erreur serveur"}), 500

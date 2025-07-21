@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
-from src.models.user import User, UserRole # Assurez-vous que UserRole est défini dans user.py
-from src.models.database import db
+from ..models.user import User, UserRole # Assurez-vous que UserRole est défini dans user.py
+from ..models.database import db
 import re
 import traceback
 

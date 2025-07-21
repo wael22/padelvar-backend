@@ -5,6 +5,13 @@ from sqlalchemy.exc import IntegrityError
 import uuid
 import logging
 
+
+
+
+
+
+
+
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,13 +60,12 @@ def create_user():
         except ValueError:
             return jsonify({"error": "Rôle invalide"}), 400
         
-        new_user = User(
-            email=email,
-            name=name,
-            role=user_role,
-            phone_number=data.get("phone_number"),
-            credits_balance=data.get("credits_balance", 0)
-        )
+        new_user = User()
+        new_user.email = email
+        new_user.name = name
+        new_user.role = user_role
+        new_user.phone_number = data.get("phone_number")
+        new_user.credits_balance = data.get("credits_balance", 0)
         if data.get("password"):
             new_user.password_hash = generate_password_hash(data["password"])
         
@@ -173,23 +179,21 @@ def create_club():
         email = data["email"].lower().strip()
 
         # Créer le club
-        new_club = Club(
-            name=data["name"].strip(),
-            address=data.get("address"),
-            phone_number=data.get("phone_number"),
-            email=email
-        )
+        new_club = Club()
+        new_club.name = data["name"].strip()
+        new_club.address = data.get("address")
+        new_club.phone_number = data.get("phone_number")
+        new_club.email = email
         db.session.add(new_club)
         db.session.flush() # Pour obtenir l'ID du club avant le commit
 
         # Créer automatiquement un utilisateur de type CLUB lié au club créé
-        club_user = User(
-            email=email,
-            password_hash=generate_password_hash(data["password"]),
-            name=data["name"].strip(),
-            role=UserRole.CLUB,
-            club_id=new_club.id
-        )
+        club_user = User()
+        club_user.email = email
+        club_user.password_hash = generate_password_hash(data["password"])
+        club_user.name = data["name"].strip()
+        club_user.role = UserRole.CLUB
+        club_user.club_id = new_club.id
         db.session.add(club_user)
         db.session.commit()
 
@@ -223,12 +227,11 @@ def create_court(club_id):
     
     try:
         qr_code = str(uuid.uuid4())
-        new_court = Court(
-            name=data["name"].strip(),
-            qr_code=qr_code,
-            camera_url=data["camera_url"].strip(),
-            club_id=club_id
-        )
+        new_court = Court()
+        new_court.name = data["name"].strip()
+        new_court.qr_code = qr_code
+        new_court.camera_url = data["camera_url"].strip()
+        new_court.club_id = club_id
         db.session.add(new_court)
         db.session.commit()
         return jsonify({"message": "Terrain créé avec succès", "court": new_court.to_dict()}), 201
