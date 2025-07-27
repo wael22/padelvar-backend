@@ -63,7 +63,6 @@ def stop_recording():
         data = request.get_json()
         court_id = data.get('court_id')
 
-        # Vérification cruciale
         if not court_id:
             return jsonify({'error': 'court_id manquant, impossible de sauvegarder la vidéo'}), 400
 
@@ -75,7 +74,7 @@ def stop_recording():
         
         new_video = Video(
             user_id=user.id,
-            court_id=court_id, # On s'assure qu'il est bien là
+            court_id=court_id,
             file_url=f'/videos/simulated_{data.get("recording_id")}.mp4',
             is_unlocked=True,
             title=data.get('title', f'Match du {datetime.now().strftime("%d/%m/%Y %H:%M")}'),
@@ -92,11 +91,8 @@ def stop_recording():
         
     except Exception as e:
         db.session.rollback()
-        try:
-            logger.error(f"Erreur lors de l'arrêt de l'enregistrement: {e}")
-        except Exception:
-            pass
-        return jsonify({'error': "Erreur lors de l'arrêt de l'enregistrement"}), 500
+        logger.error(f"Erreur lors de l'arrêt de l'enregistrement: {e}")
+        return jsonify({"error": "Erreur lors de l'arrêt de l'enregistrement"}), 500
 
 @videos_bp.route('/<int:video_id>/unlock', methods=['POST'])
 def unlock_video(video_id):

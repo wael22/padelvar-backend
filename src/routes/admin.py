@@ -27,6 +27,11 @@ def log_club_action(user_id, club_id, action_type, details=None, performed_by_id
     try:
         if performed_by_id is None:
             performed_by_id = user_id
+        
+        if not club_id:
+            db.session.commit()
+            return
+
         history_entry = ClubActionHistory(
             user_id=user_id,
             club_id=club_id,
@@ -39,9 +44,9 @@ def log_club_action(user_id, club_id, action_type, details=None, performed_by_id
         db.session.commit()
     except Exception as e:
         db.session.rollback()
-        print(f"Erreur lors de l'enregistrement de l'historique: {e}")
+        logger.error(f"Erreur lors de l'enregistrement de l'historique: {e}")
 
-# --- ROUTES DE GESTION DES UTILISATEURS ---
+# --- ROUTES DE GESTION DES UTILISATEURS (CRUD COMPLET) ---
 
 @admin_bp.route("/users", methods=["GET"])
 def get_all_users():
@@ -112,18 +117,13 @@ def add_credits(user_id):
         old_balance = user.credits_balance
         user.credits_balance += credits_to_add
         
-        # On logue l'action SEULEMENT si le joueur est affilié à un club
-        if user.club_id:
-            log_club_action(
-                user_id=user.id, 
-                club_id=user.club_id,
-                action_type='add_credits', 
-                details={'credits_added': credits_to_add, 'old_balance': old_balance, 'new_balance': user.credits_balance}, 
-                performed_by_id=session.get('user_id')
-            )
-        else:
-            # Si le joueur n'a pas de club, on commit quand même le changement de crédits
-            db.session.commit()
+        log_club_action(
+            user_id=user.id, 
+            club_id=user.club_id,
+            action_type='add_credits', 
+            details={'credits_added': credits_to_add, 'old_balance': old_balance, 'new_balance': user.credits_balance}, 
+            performed_by_id=session.get('user_id')
+        )
         
         return jsonify({"message": "Crédits ajoutés", "user": user.to_dict()}), 200
     except Exception as e:
@@ -131,7 +131,7 @@ def add_credits(user_id):
         logger.error(f"Erreur lors de l'ajout de crédits: {e}")
         return jsonify({"error": "Erreur lors de l'ajout de crédits"}), 500
 
-# --- ROUTES DE GESTION DES CLUBS ---
+# --- ROUTES DE GESTION DES CLUBS (CRUD COMPLET) ---
 
 @admin_bp.route("/clubs", methods=["GET"])
 def get_all_clubs():
@@ -187,7 +187,7 @@ def delete_club(club_id):
         db.session.rollback()
         return jsonify({"error": "Erreur lors de la suppression"}), 500
 
-# --- ROUTES DE GESTION DES TERRAINS ---
+# --- ROUTES DE GESTION DES TERRAINS (CRUD COMPLET) ---
 
 @admin_bp.route("/clubs/<int:club_id>/courts", methods=["GET"])
 def get_club_courts(club_id):
@@ -268,7 +268,7 @@ def get_all_clubs_history():
         history_entries = db.session.query(ClubActionHistory).order_by(ClubActionHistory.performed_at.desc()).all()
         
         user_ids = {h.user_id for h in history_entries} | {h.performed_by_id for h in history_entries}
-        club_ids = {h.club_id for h in history_entries}
+        club_ids = {h.club_id for h in history_entries if h.club_id is not None}
         
         users = {u.id: u.name for u in User.query.filter(User.id.in_(user_ids)).all()}
         clubs = {c.id: c.name for c in Club.query.filter(Club.id.in_(club_ids)).all()}
@@ -277,12 +277,14 @@ def get_all_clubs_history():
         for entry in history_entries:
             history_data.append({
                 "id": entry.id,
-                "player_name": users.get(entry.user_id, "Utilisateur inconnu"),
-                "club_name": clubs.get(entry.club_id, "Club inconnu"),
+                "user_id": entry.user_id,
+                "club_id": entry.club_id,
+                "player_name": users.get(entry.user_id, "N/A"),
+                "club_name": clubs.get(entry.club_id, "N/A"),
                 "action_type": entry.action_type,
                 "action_details": entry.action_details,
                 "performed_at": entry.performed_at.isoformat(),
-                "performed_by_name": users.get(entry.performed_by_id, "Utilisateur inconnu")
+                "performed_by_name": users.get(entry.performed_by_id, "N/A")
             })
             
         return jsonify({"history": history_data}), 200

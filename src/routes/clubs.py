@@ -1,6 +1,6 @@
-
 from flask import Blueprint, request, jsonify, session
-from src.models.user import db, User, Club, Video, UserRole, Court, ClubHistory
+# MODIFIÉ : On importe ClubActionHistory
+from src.models.user import db, User, Club, Video, UserRole, Court, ClubActionHistory
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -8,119 +8,151 @@ logger = logging.getLogger(__name__)
 
 clubs_bp = Blueprint("clubs", __name__)
 
-def require_club_access():
-    user = get_current_user()
-    if not user or user.role != UserRole.CLUB:
-        return None, (jsonify({"error": "Accès non autorisé"}), 403)
-    if not getattr(user, 'club_id', None):
-        return None, (jsonify({"error": "Club non associé à cet utilisateur"}), 404)
-    return user, None
+# Route pour qu'un joueur suive un club et soit ajouté à la liste des joueurs du club
+@clubs_bp.route("/follow", methods=["POST"])
+def follow_club():
+    user_id = session.get("user_id")
+    club_id = request.json.get("club_id")
+    if not user_id or not club_id:
+        return jsonify({"error": "Données manquantes"}), 400
+    user = User.query.get(user_id)
+    club = Club.query.get(club_id)
+    if not user or not club:
+        return jsonify({"error": "Utilisateur ou club introuvable"}), 404
+    # Ajoute le club à la liste des clubs suivis
+    if club not in user.followed_clubs:
+        user.followed_clubs.append(club)
+    # Met à jour le club_id pour l'afficher dans Joueurs du Club
+    user.club_id = club.id
+    db.session.commit()
+    return jsonify({"success": True, "user": user.to_dict()}), 200
+from flask import Blueprint, request, jsonify, session
+# MODIFIÉ : On importe ClubActionHistory
+from src.models.user import db, User, Club, Video, UserRole, Court, ClubActionHistory
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+clubs_bp = Blueprint("clubs", __name__)
+
+# Nouvelle route pour récupérer les followers du club
+@clubs_bp.route("/followers", methods=["GET"])
+def get_club_followers():
+    user = require_club_access()
+    if not user:
+        return jsonify({"error": "Accès non autorisé"}), 403
+    club = Club.query.get(user.club_id)
+    if not club:
+        return jsonify({"error": "Club non trouvé"}), 404
+    # Les followers sont les joueurs qui suivent ce club
+    followers = club.followers.all() if hasattr(club, 'followers') else []
+    return jsonify({"followers": [f.to_dict() for f in followers]}), 200
+
+from flask import Blueprint, request, jsonify, session
+# MODIFIÉ : On importe ClubActionHistory
+from src.models.user import db, User, Club, Video, UserRole, Court, ClubActionHistory
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+clubs_bp = Blueprint("clubs", __name__)
 
 def get_current_user():
     user_id = session.get("user_id")
-    if not user_id:
-        return None
+    if not user_id: return None
     return User.query.get(user_id)
 
-# --- ROUTES DE GESTION DES JOUEURS PAR LE CLUB ---
-# CORRECTION: Simplification des URL. Ex: /api/clubs/players/3 -> /api/clubs/3
-
-@clubs_bp.route("/<int:player_id>", methods=["PUT"])
-def update_player_by_club(player_id):
-    """Permet aux clubs de modifier les informations des joueurs"""
-    club_user, error = require_club_access()
-    if error: return error
-    
-    player = User.query.get(player_id)
-    club_id = getattr(club_user, 'club_id', None)
-    if not player or not getattr(player, 'club_id', None) or player.club_id != club_id:
-        return jsonify({"error": "Joueur non trouvé dans ce club"}), 404
-    
-    data = request.get_json()
-    if "name" in data: player.name = data["name"].strip()
-    if "phone_number" in data: player.phone_number = data["phone_number"]
-    if "credits_balance" in data: player.credits_balance = data["credits_balance"]
-    
-    db.session.commit()
-    return jsonify({"message": "Joueur mis à jour", "player": player.to_dict()}), 200
-
-@clubs_bp.route("/<int:player_id>/add-credits", methods=["POST"])
-def add_credits_to_player_by_club(player_id):
-    """Permet aux clubs d'ajouter des crédits à un joueur"""
-    club_user, error = require_club_access()
-    if error: return error
-
-    player = User.query.get(player_id)
-    club_id = getattr(club_user, 'club_id', None)
-    if not player or not getattr(player, 'club_id', None) or player.club_id != club_id:
-        return jsonify({"error": "Joueur non trouvé dans ce club"}), 404
-        
-    data = request.get_json()
-    credits_to_add = data.get("credits", 0)
-    if not isinstance(credits_to_add, int) or credits_to_add <= 0:
-        return jsonify({"error": "Le nombre de crédits doit être un entier positif"}), 400
-        
-    player.credits_balance += credits_to_add
-    db.session.commit()
-    return jsonify({"message": "Crédits ajoutés", "player": player.to_dict()}), 200
-
-# --- AUTRES ROUTES (Dashboard, Followers, etc.) ---
-# Ces routes ne changent pas car elles ne prennent pas d'ID dans l'URL
+def require_club_access():
+    user = get_current_user()
+    if not user or user.role != UserRole.CLUB: return None
+    return user
 
 @clubs_bp.route("/dashboard", methods=["GET"])
 def get_club_dashboard():
-    user, error = require_club_access()
-    if error: return error
-    try:
-        club_id = getattr(user, 'club_id', None)
-        if not club_id:
-            return jsonify({"error": "Club non trouvé"}), 404
-        club = Club.query.get(club_id)
-        if not club:
-            return jsonify({"error": "Club non trouvé"}), 404
-        players = User.query.filter_by(club_id=club.id, role=UserRole.PLAYER).all()
-        courts = Court.query.filter_by(club_id=club.id).all()
-        player_ids = [p.id for p in players]
-        videos = Video.query.filter(Video.user_id.in_(player_ids)).all()
-        return jsonify({
-            "club": club.to_dict(),
-            "players": [p.to_dict() for p in players],
-            "courts": [c.to_dict() for c in courts],
-            "videos": [v.to_dict() for v in videos],
-            "stats": {
-                "total_players": len(players),
-                "total_videos": len(videos),
-                "total_credits_distributed": sum(p.credits_balance for p in players),
-                "total_courts": len(courts)
-            }
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    user = require_club_access()
+    if not user: return jsonify({"error": "Accès non autorisé"}), 403
+    
+    club = Club.query.get(user.club_id)
+    if not club: return jsonify({"error": "Club non trouvé"}), 404
 
-@clubs_bp.route("/followers", methods=["GET"])
-def get_club_followers():
-    user, error = require_club_access()
-    if error: return error
-    club_id = getattr(user, 'club_id', None)
-    if not club_id:
-        return jsonify({"error": "Club non trouvé"}), 404
-    followers = User.query.filter(User.followed_clubs.any(id=club_id)).all()
-    return jsonify({"followers": [f.to_dict() for f in followers]}), 200
+    # On récupère les joueurs inscrits (ceux qui ont ce club_id)
+    registered_players = User.query.filter_by(club_id=club.id, role=UserRole.PLAYER).all()
+    
+    # On récupère les vidéos de ces joueurs
+    player_ids = [p.id for p in registered_players]
+    videos = Video.query.filter(Video.user_id.in_(player_ids)).all() if player_ids else []
+
+    return jsonify({
+        "club": club.to_dict(),
+        "stats": {
+            "total_players": len(registered_players),
+            "total_videos": len(videos),
+            "total_credits_distributed": sum(p.credits_balance for p in registered_players),
+            "total_courts": len(club.courts)
+        },
+        "players": [p.to_dict() for p in registered_players],
+        "videos": [v.to_dict() for v in videos],
+        "courts": [court.to_dict() for court in club.courts] if hasattr(club, 'courts') else []
+    }), 200
+
+@clubs_bp.route("/videos", methods=["GET"])
+def get_club_videos():
+    user = require_club_access()
+    if not user: return jsonify({"error": "Accès non autorisé"}), 403
+    
+    club = Club.query.get(user.club_id)
+    if not club: return jsonify({"error": "Club non trouvé"}), 404
+
+    registered_players = User.query.filter_by(club_id=club.id, role=UserRole.PLAYER).all()
+    player_ids = [p.id for p in registered_players]
+    
+    videos = db.session.query(Video, User.name.label('player_name'))\
+        .join(User, Video.user_id == User.id)\
+        .filter(Video.user_id.in_(player_ids)).order_by(Video.recorded_at.desc()).all() if player_ids else []
+
+    videos_data = []
+    for video, player_name in videos:
+        video_dict = video.to_dict()
+        video_dict['player_name'] = player_name
+        videos_data.append(video_dict)
+        
+    return jsonify({"videos": videos_data}), 200
 
 @clubs_bp.route("/history", methods=["GET"])
 def get_club_history():
-    user, error = require_club_access()
-    if error: return error
-    club_id = getattr(user, 'club_id', None)
-    if not club_id:
-        return jsonify({"error": "Club non trouvé"}), 404
-    history_entries = db.session.query(ClubHistory, User.name.label('player_name')).join(User, ClubHistory.player_id == User.id).filter(ClubHistory.club_id == club_id).order_by(ClubHistory.performed_at.desc()).limit(100).all()
-    history_list = []
-    for entry, name in history_entries:
-        if entry and hasattr(entry, 'to_dict'):
-            d = entry.to_dict()
-            d['player_name'] = name
-            history_list.append(d)
-    return jsonify({"history": history_list}), 200
+    user = require_club_access()
+    if not user: return jsonify({"error": "Accès non autorisé"}), 403
+    
+    club = Club.query.get(user.club_id)
+    if not club: return jsonify({"error": "Club non trouvé"}), 404
 
-# ... (gardez les autres routes comme /all, /info, etc. si elles existent)
+    # MODIFIÉ : On utilise ClubActionHistory
+    # Join User twice: once for the player, once for performed_by
+    from sqlalchemy.orm import aliased
+    Player = aliased(User)
+    Performer = aliased(User)
+    history_entries = (
+        db.session.query(
+            ClubActionHistory,
+            Player.name.label('player_name'),
+            Performer.name.label('performed_by_name')
+        )
+        .join(Player, ClubActionHistory.user_id == Player.id)
+        .join(Performer, ClubActionHistory.performed_by_id == Performer.id)
+        .filter(ClubActionHistory.club_id == club.id)
+        .order_by(ClubActionHistory.performed_at.desc())
+        .limit(100)
+        .all()
+    )
+
+    history_data = []
+    for entry, player_name, performed_by_name in history_entries:
+        entry_dict = entry.to_dict()
+        entry_dict['player_name'] = player_name
+        entry_dict['performed_by_name'] = performed_by_name
+        history_data.append(entry_dict)
+    return jsonify({"history": history_data}), 200
+
+# ... (gardez les autres routes du club si elles existent)
