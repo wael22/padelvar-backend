@@ -1,5 +1,6 @@
+# padelvar-backend/src/routes/players.py
+
 from flask import Blueprint, request, jsonify, session
-# MODIFIÉ : On importe ClubActionHistory
 from src.models.user import db, User, Club, UserRole, ClubActionHistory
 import logging
 import json
@@ -19,21 +20,14 @@ def require_player_access():
     if not user or user.role != UserRole.PLAYER: return None
     return user
 
-# ====================================================================
-# CORRECTION : La fonction de log est maintenant dans admin.py,
-# mais on la garde ici pour la logique de suivi des joueurs.
-# ====================================================================
 def log_action(club_id, player_id, action_type, action_details, performed_by_id):
     try:
         history_entry = ClubActionHistory(
-            club_id=club_id,
-            user_id=player_id,
-            action_type=action_type,
+            club_id=club_id, user_id=player_id, action_type=action_type,
             action_details=json.dumps(action_details) if action_details else None,
             performed_by_id=performed_by_id
         )
         db.session.add(history_entry)
-        db.session.commit()
     except Exception as e:
         db.session.rollback()
         logger.error(f"Erreur lors de l'enregistrement de l'historique: {e}")
@@ -65,17 +59,19 @@ def follow_club(club_id):
         return jsonify({"error": "Vous suivez déjà ce club"}), 409
         
     user.followed_clubs.append(club)
+    user.club_id = club.id
     
     log_action(
-        club_id=club_id,
-        player_id=user.id,
-        action_type='follow_club',
-        action_details={"club_name": club.name},
-        performed_by_id=user.id
+        club_id=club_id, player_id=user.id, action_type='follow_club',
+        action_details={"club_name": club.name}, performed_by_id=user.id
     )
     
+    db.session.commit()
     return jsonify({"message": f"Vous suivez maintenant {club.name}"}), 200
 
+# ====================================================================
+# CORRECTION APPLIQUÉE ICI
+# ====================================================================
 @players_bp.route("/clubs/<int:club_id>/unfollow", methods=["POST"])
 def unfollow_club(club_id):
     user = require_player_access()
@@ -88,13 +84,18 @@ def unfollow_club(club_id):
         
     user.followed_clubs.remove(club)
     
+    # LIGNE CRUCIALE POUR CORRIGER LE COMPTAGE DES JOUEURS
+    # Si le joueur quitte le club qui était défini comme son club principal,
+    # on réinitialise son affiliation à "Aucun club".
+    if user.club_id == club_id:
+        user.club_id = None
+    
     log_action(
-        club_id=club_id,
-        player_id=user.id,
-        action_type='unfollow_club',
-        action_details={"club_name": club.name},
-        performed_by_id=user.id
+        club_id=club_id, player_id=user.id, action_type='unfollow_club',
+        action_details={"club_name": club.name}, performed_by_id=user.id
     )
+    
+    db.session.commit()
     
     return jsonify({"message": f"Vous ne suivez plus {club.name}"}), 200
 

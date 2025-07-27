@@ -1,63 +1,74 @@
-"""
-Configuration centralisée pour l'application PadelVar
-"""
+# padelvar-backend/src/config.py
+
 import os
-from pathlib import Path
 
 class Config:
-    """Configuration de base"""
+    """Configuration de base."""
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'une-cle-secrete-difficile-a-deviner'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
     
-    # Clé secrète - à définir via variable d'environnement en production
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'padelvar_secret_key_2024_secure'
+    SESSION_COOKIE_SECURE = False
+    SESSION_COOKIE_SAMESITE = 'Lax'
+    SESSION_COOKIE_HTTPONLY = True
     
-    # Configuration de la base de données
-    # Utilise le dossier instance de Flask pour stocker la base de données
+    DEFAULT_ADMIN_EMAIL = os.environ.get('DEFAULT_ADMIN_EMAIL', 'admin@padelvar.com')
+    DEFAULT_ADMIN_PASSWORD = os.environ.get('DEFAULT_ADMIN_PASSWORD', 'password123')
+    DEFAULT_ADMIN_NAME = 'Super Admin'
+    DEFAULT_ADMIN_CREDITS = 10000
+
+    @staticmethod
+    def init_app(app):
+        pass
+
+    # ====================================================================
+    # CORRECTION ICI : Ajout de @staticmethod et suppression de 'self'
+    # ====================================================================
     @staticmethod
     def get_database_uri(app):
-        """Retourne l'URI de la base de données basée sur le dossier instance de l'app"""
-        db_path = os.path.join(app.instance_path, 'app.db')
-        return f'sqlite:///{db_path}'
-    
-    # Configuration SQLAlchemy
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SQLALCHEMY_ECHO = os.environ.get('SQLALCHEMY_ECHO', 'False').lower() == 'true'
-    
-    # Configuration CORS
-    CORS_ORIGINS = os.environ.get('CORS_ORIGINS', 'http://localhost:5173').split(',')
-    
-    # Configuration de l'admin par défaut
-    DEFAULT_ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@padelvar.com')
-    DEFAULT_ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
-    DEFAULT_ADMIN_NAME = os.environ.get('ADMIN_NAME', 'Super Admin')
-    DEFAULT_ADMIN_CREDITS = int(os.environ.get('ADMIN_CREDITS', '1000'))
+        """Retourne l'URI de la base de données."""
+        return 'sqlite:///' + os.path.join(app.instance_path, 'app.db')
+
+    def validate(self):
+        """Valide que les variables critiques sont définies."""
+        if not self.SECRET_KEY or self.SECRET_KEY == 'une-cle-secrete-difficile-a-deviner':
+            raise ValueError("SECRET_KEY n'est pas définie ou est la valeur par défaut !")
+
 
 class DevelopmentConfig(Config):
-    """Configuration pour le développement"""
+    """Configuration pour le développement."""
     DEBUG = True
-    SQLALCHEMY_ECHO = True
+    CORS_ORIGINS = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ]
+
 
 class ProductionConfig(Config):
-    """Configuration pour la production"""
+    """Configuration pour la production."""
     DEBUG = False
-    # En production, la clé secrète DOIT être définie via variable d'environnement
-    SECRET_KEY = os.environ.get('SECRET_KEY')
-    
-    @classmethod
-    def validate(cls):
-        """Valide que la configuration de production est correcte"""
-        if not cls.SECRET_KEY:
-            raise ValueError("SECRET_KEY doit être définie en production")
+    SESSION_COOKIE_SECURE = True
+    CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '').split(',')
+
+    # ====================================================================
+    # CORRECTION ICI : Ajout de @staticmethod et suppression de 'self'
+    # ====================================================================
+    @staticmethod
+    def get_database_uri(app):
+        """En production, utiliser une base de données plus robuste."""
+        # On appelle directement la méthode statique de la classe parente
+        return os.environ.get('DATABASE_URL') or Config.get_database_uri(app)
+
 
 class TestingConfig(Config):
-    """Configuration pour les tests"""
+    """Configuration pour les tests."""
     TESTING = True
     SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
+    CORS_ORIGINS = "*"
 
-# Dictionnaire des configurations disponibles
+
 config = {
     'development': DevelopmentConfig,
     'production': ProductionConfig,
     'testing': TestingConfig,
     'default': DevelopmentConfig
 }
-

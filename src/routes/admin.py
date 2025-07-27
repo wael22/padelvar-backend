@@ -4,6 +4,8 @@ from flask import Blueprint, request, jsonify, session
 from src.models.user import db, User, Club, Court, Video, UserRole, ClubActionHistory
 from werkzeug.security import generate_password_hash
 from sqlalchemy.exc import IntegrityError
+# NOUVEL IMPORT NÉCESSAIRE
+from sqlalchemy.orm import aliased
 import uuid
 import logging
 import json
@@ -236,7 +238,7 @@ def delete_court(court_id):
 
 # --- ROUTES VIDÉOS & HISTORIQUE ---
 
-@admin_bp.route("/videos/all-clubs", methods=["GET"])
+@admin_bp.route("/videos", methods=["GET"])
 def get_all_clubs_videos():
     if not require_super_admin(): return jsonify({"error": "Accès non autorisé"}), 403
     try:
@@ -261,33 +263,50 @@ def get_all_clubs_videos():
         logger.error(f"Erreur lors de la récupération des vidéos: {e}")
         return jsonify({"error": "Erreur serveur"}), 500
 
+# ====================================================================
+# CORRECTION MAJEURE ICI
+# ====================================================================
 @admin_bp.route("/clubs/history/all", methods=["GET"])
 def get_all_clubs_history():
-    if not require_super_admin(): return jsonify({"error": "Accès non autorisé"}), 403
+    if not require_super_admin():
+        return jsonify({"error": "Accès non autorisé"}), 403
     try:
-        history_entries = db.session.query(ClubActionHistory).order_by(ClubActionHistory.performed_at.desc()).all()
-        
-        user_ids = {h.user_id for h in history_entries} | {h.performed_by_id for h in history_entries}
-        club_ids = {h.club_id for h in history_entries if h.club_id is not None}
-        
-        users = {u.id: u.name for u in User.query.filter(User.id.in_(user_ids)).all()}
-        clubs = {c.id: c.name for c in Club.query.filter(Club.id.in_(club_ids)).all()}
+        # Créer des alias pour joindre la table User deux fois
+        Player = aliased(User, name='player')
+        Performer = aliased(User, name='performer')
+
+        # Requête unique avec des jointures externes (outerjoin) pour plus de robustesse
+        history_query = (
+            db.session.query(
+                ClubActionHistory,
+                Player.name.label('player_name'),
+                Club.name.label('club_name'),
+                Performer.name.label('performed_by_name')
+            )
+            .outerjoin(Player, ClubActionHistory.user_id == Player.id)
+            .outerjoin(Performer, ClubActionHistory.performed_by_id == Performer.id)
+            .outerjoin(Club, ClubActionHistory.club_id == Club.id)
+            .order_by(ClubActionHistory.performed_at.desc())
+            .all()
+        )
 
         history_data = []
-        for entry in history_entries:
+        for entry, player_name, club_name, performed_by_name in history_query:
             history_data.append({
                 "id": entry.id,
                 "user_id": entry.user_id,
                 "club_id": entry.club_id,
-                "player_name": users.get(entry.user_id, "N/A"),
-                "club_name": clubs.get(entry.club_id, "N/A"),
+                "player_name": player_name or "Utilisateur supprimé",
+                "club_name": club_name or "Club non spécifié",
                 "action_type": entry.action_type,
                 "action_details": entry.action_details,
                 "performed_at": entry.performed_at.isoformat(),
-                "performed_by_name": users.get(entry.performed_by_id, "N/A")
+                "performed_by_id": entry.performed_by_id,
+                "performed_by_name": performed_by_name or "Auteur inconnu"
             })
             
         return jsonify({"history": history_data}), 200
+        
     except Exception as e:
-        logger.error(f"Erreur lors de la récupération de l'historique: {e}")
+        logger.error(f"Erreur lors de la récupération de l'historique global: {e}")
         return jsonify({"error": "Erreur serveur"}), 500
