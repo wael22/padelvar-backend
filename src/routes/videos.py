@@ -1,3 +1,6 @@
+# Ajout de l'import du logger
+import logging
+logger = logging.getLogger(__name__)
 from flask import Blueprint, request, jsonify, session
 # MODIFIÉ : Ajout de Club et Court pour la nouvelle route
 from src.models.user import db, User, Video, Court, Club, UserRole
@@ -58,11 +61,12 @@ def stop_recording():
     
     try:
         data = request.get_json()
-        recording_id = data.get('recording_id')
-        title = data.get('title', f'Match du {datetime.now().strftime("%d/%m/%Y %H:%M")}')
-        description = data.get('description', '')
         court_id = data.get('court_id')
-        
+
+        # Vérification cruciale
+        if not court_id:
+            return jsonify({'error': 'court_id manquant, impossible de sauvegarder la vidéo'}), 400
+
         credits_cost = 1
         if user.credits_balance < credits_cost:
             return jsonify({'error': 'Crédits insuffisants'}), 400
@@ -71,11 +75,11 @@ def stop_recording():
         
         new_video = Video(
             user_id=user.id,
-            court_id=court_id,
-            file_url=f'/videos/simulated_{recording_id}.mp4',
+            court_id=court_id, # On s'assure qu'il est bien là
+            file_url=f'/videos/simulated_{data.get("recording_id")}.mp4',
             is_unlocked=True,
-            title=title,
-            description=description
+            title=data.get('title', f'Match du {datetime.now().strftime("%d/%m/%Y %H:%M")}'),
+            description=data.get('description', '')
         )
         
         db.session.add(new_video)
@@ -88,7 +92,11 @@ def stop_recording():
         
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': 'Erreur lors de l\'arrêt de l\'enregistrement'}), 500
+        try:
+            logger.error(f"Erreur lors de l'arrêt de l'enregistrement: {e}")
+        except Exception:
+            pass
+        return jsonify({'error': "Erreur lors de l'arrêt de l'enregistrement"}), 500
 
 @videos_bp.route('/<int:video_id>/unlock', methods=['POST'])
 def unlock_video(video_id):
