@@ -159,20 +159,39 @@ def create_club():
         db.session.rollback()
         return jsonify({"error": "Erreur lors de la création"}), 500
 
+
+# ====================================================================
+# CORRECTION DE LA SYNCHRONISATION (ADMIN -> CLUB)
+# ====================================================================
 @admin_bp.route("/clubs/<int:club_id>", methods=["PUT"])
 def update_club(club_id):
     if not require_super_admin(): return jsonify({"error": "Accès non autorisé"}), 403
+    
     club = Club.query.get_or_404(club_id)
+    # On trouve l'utilisateur associé à ce club
+    club_user = User.query.filter_by(club_id=club_id, role=UserRole.CLUB).first()
+    
     data = request.get_json()
+    
     try:
+        # On met à jour l'objet Club
         if "name" in data: club.name = data["name"]
         if "address" in data: club.address = data["address"]
         if "phone_number" in data: club.phone_number = data["phone_number"]
         if "email" in data: club.email = data["email"]
+        
+        # On met à jour l'objet User associé pour qu'il corresponde
+        if club_user:
+            if "name" in data: club_user.name = data["name"]
+            if "email" in data: club_user.email = data["email"]
+            if "phone_number" in data: club_user.phone_number = data["phone_number"]
+        
         db.session.commit()
         return jsonify({"message": "Club mis à jour", "club": club.to_dict()}), 200
+        
     except Exception as e:
         db.session.rollback()
+        logger.error(f"Erreur lors de la mise à jour du club par l'admin: {e}")
         return jsonify({"error": "Erreur lors de la mise à jour"}), 500
 
 @admin_bp.route("/clubs/<int:club_id>", methods=["DELETE"])
@@ -253,11 +272,13 @@ def get_all_clubs_videos():
 
         videos_data = []
         for video, player_name, club_name in results:
-            video_dict = video.to_dict()
-            video_dict['player_name'] = player_name
-            video_dict['club_name'] = club_name
-            videos_data.append(video_dict)
-        
+            try:
+                video_dict = video.to_dict()
+                video_dict['player_name'] = player_name
+                video_dict['club_name'] = club_name
+                videos_data.append(video_dict)
+            except Exception as ve:
+                logger.error(f"Erreur de sérialisation vidéo (id={getattr(video, 'id', None)}): {ve}")
         return jsonify({"videos": videos_data}), 200
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des vidéos: {e}")
@@ -306,7 +327,6 @@ def get_all_clubs_history():
             })
             
         return jsonify({"history": history_data}), 200
-        
     except Exception as e:
         logger.error(f"Erreur lors de la récupération de l'historique global: {e}")
         return jsonify({"error": "Erreur serveur"}), 500

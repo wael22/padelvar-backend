@@ -67,7 +67,9 @@ def create_app(config_name=None):
     # Configuration CORS
     CORS(app, 
          origins=app.config['CORS_ORIGINS'], 
-         supports_credentials=True)
+         supports_credentials=True,
+         allow_headers=["Content-Type", "Authorization"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
     
     # Enregistrement des blueprints
     app.register_blueprint(auth_bp, url_prefix='/api/auth')

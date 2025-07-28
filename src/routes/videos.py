@@ -1,11 +1,6 @@
-# Ajout de l'import du logger
-import logging
-logger = logging.getLogger(__name__)
 from flask import Blueprint, request, jsonify, session
-# MODIFIÉ : Ajout de Club et Court pour la nouvelle route
-from src.models.user import db, User, Video, Court, Club, UserRole
+from src.models.user import db, User, Video, Court, Club
 from datetime import datetime
-import os
 
 videos_bp = Blueprint('videos', __name__)
 
@@ -20,152 +15,72 @@ def get_my_videos():
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
-    
-    try:
-        videos = Video.query.filter_by(user_id=user.id).order_by(Video.recorded_at.desc()).all()
-        return jsonify({
-            'videos': [video.to_dict() for video in videos]
-        }), 200
-    except Exception as e:
-        return jsonify({'error': 'Erreur lors de la récupération des vidéos'}), 500
+    videos = Video.query.filter_by(user_id=user.id).order_by(Video.recorded_at.desc()).all()
+    return jsonify({'videos': [v.to_dict() for v in videos]}), 200
 
 @videos_bp.route('/record', methods=['POST'])
 def start_recording():
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
-    
-    try:
-        data = request.get_json()
-        
-        if not data.get('court_id'):
-            return jsonify({'error': 'Le terrain doit être sélectionné'}), 400
-        
-        court = Court.query.get(data['court_id'])
-        if not court:
-            return jsonify({'error': 'Terrain non trouvé'}), 400
-        
-        return jsonify({
-            'message': 'Enregistrement démarré',
-            'recording_id': f"rec_{user.id}_{int(datetime.now().timestamp())}",
-        }), 200
-        
-    except Exception as e:
-        return jsonify({'error': 'Erreur lors du démarrage de l\'enregistrement'}), 500
+    data = request.get_json()
+    if not data.get('court_id'):
+        return jsonify({'error': 'Le terrain est requis'}), 400
+    return jsonify({
+        'message': 'Enregistrement démarré',
+        'recording_id': f"rec_{user.id}_{int(datetime.now().timestamp())}",
+    }), 200
 
 @videos_bp.route('/stop-recording', methods=['POST'])
 def stop_recording():
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
-    
+    if user.credits_balance < 1:
+        return jsonify({'error': 'Crédits insuffisants'}), 400
+    data = request.get_json()
+    court_id = data.get('court_id')
+    if not court_id:
+        return jsonify({'error': 'court_id manquant'}), 400
     try:
-        data = request.get_json()
-        court_id = data.get('court_id')
-
-        if not court_id:
-            return jsonify({'error': 'court_id manquant, impossible de sauvegarder la vidéo'}), 400
-
-        credits_cost = 1
-        if user.credits_balance < credits_cost:
-            return jsonify({'error': 'Crédits insuffisants'}), 400
-        
-        user.credits_balance -= credits_cost
-        
+        user.credits_balance -= 1
         new_video = Video(
             user_id=user.id,
             court_id=court_id,
             file_url=f'/videos/simulated_{data.get("recording_id")}.mp4',
-            is_unlocked=True,
-            title=data.get('title', f'Match du {datetime.now().strftime("%d/%m/%Y %H:%M")}'),
+            title=data.get('title') or f'Match du {datetime.now().strftime("%d/%m/%Y")}',
             description=data.get('description', '')
         )
-        
         db.session.add(new_video)
         db.session.commit()
-        
-        return jsonify({
-            'message': 'Vidéo sauvegardée',
-            'video': new_video.to_dict(),
-        }), 201
-        
+        return jsonify({'message': 'Vidéo sauvegardée', 'video': new_video.to_dict()}), 201
     except Exception as e:
         db.session.rollback()
-        logger.error(f"Erreur lors de l'arrêt de l'enregistrement: {e}")
-        return jsonify({"error": "Erreur lors de l'arrêt de l'enregistrement"}), 500
+        return jsonify({"error": "Erreur lors de l'arrêt"}), 500
 
-@videos_bp.route('/<int:video_id>/unlock', methods=['POST'])
-def unlock_video(video_id):
+@videos_bp.route('/<int:video_id>', methods=['DELETE'])
+def delete_video(video_id):
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
-    
+    video = Video.query.get_or_404(video_id)
+    if video.user_id != user.id:
+        return jsonify({'error': 'Accès non autorisé'}), 403
     try:
-        video = Video.query.get(video_id)
-        if not video:
-            return jsonify({'error': 'Vidéo non trouvée'}), 404
-        
-        # Vérifier que la vidéo appartient à l'utilisateur
-        if video.user_id != user.id:
-            return jsonify({'error': 'Accès non autorisé à cette vidéo'}), 403
-        
-        # Vérifier si la vidéo est déjà déverrouillée
-        if video.is_unlocked:
-            return jsonify({'message': 'Vidéo déjà déverrouillée'}), 200
-        
-        # Vérifier si l'utilisateur a assez de crédits
-        if user.credits_balance < video.credits_cost:
-            return jsonify({'error': 'Crédits insuffisants'}), 400
-        
-        # Débiter les crédits et déverrouiller la vidéo
-        user.credits_balance -= video.credits_cost
-        video.is_unlocked = True
-        
+        db.session.delete(video)
         db.session.commit()
-        
-        return jsonify({
-            'message': 'Vidéo déverrouillée avec succès',
-            'video': video.to_dict(),
-            'remaining_credits': user.credits_balance
-        }), 200
-        
-    except Exception as e:
+        return jsonify({'message': 'Vidéo supprimée'}), 200
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': 'Erreur lors du déverrouillage de la vidéo'}), 500
+        return jsonify({"error": "Erreur lors de la suppression"}), 500
 
-@videos_bp.route('/<int:video_id>', methods=['GET'])
-def get_video(video_id):
+@videos_bp.route("/clubs/<int:club_id>/courts", methods=["GET"])
+def get_courts_for_club(club_id):
     user = get_current_user()
     if not user:
-        return jsonify({'error': 'Non authentifié'}), 401
-    
-    try:
-        video = Video.query.get(video_id)
-        if not video:
-            return jsonify({'error': 'Vidéo non trouvée'}), 404
-        
-        # Vérifier les permissions d'accès
-        can_access = False
-        
-        if video.user_id == user.id:
-            # Propriétaire de la vidéo
-            can_access = True
-        elif user.role == UserRole.SUPER_ADMIN:
-            # Super admin peut voir toutes les vidéos
-            can_access = True
-        elif user.role == UserRole.CLUB and user.club_id:
-            # Club peut voir les vidéos de ses joueurs
-            video_owner = User.query.get(video.user_id)
-            if video_owner and video_owner.club_id == user.club_id:
-                can_access = True
-        
-        if not can_access:
-            return jsonify({'error': 'Accès non autorisé à cette vidéo'}), 403
-        
-        return jsonify({'video': video.to_dict()}), 200
-        
-    except Exception as e:
-        return jsonify({'error': 'Erreur lors de la récupération de la vidéo'}), 500
+        return jsonify({"error": "Accès non autorisé"}), 401
+    courts = Court.query.filter_by(club_id=club_id).all()
+    return jsonify({"courts": [c.to_dict() for c in courts]}), 200
 
 @videos_bp.route('/<int:video_id>/share', methods=['POST'])
 def share_video(video_id):
@@ -323,30 +238,29 @@ def get_camera_stream(court_id):
     except Exception as e:
         return jsonify({'error': 'Erreur lors de la récupération du flux caméra'}), 500
 
+
 # ====================================================================
-# NOUVELLE ROUTE À AJOUTER À LA FIN DU FICHIER
+# NOUVELLE ROUTE POUR METTRE À JOUR UNE VIDÉO
 # ====================================================================
-@videos_bp.route("/clubs/<int:club_id>/courts", methods=["GET"])
-def get_courts_for_club(club_id):
-    """
-    Route pour récupérer les terrains (courts) d'un club spécifique.
-    Accessible par tout utilisateur connecté.
-    """
+@videos_bp.route('/<int:video_id>', methods=['PUT'])
+def update_video(video_id):
     user = get_current_user()
     if not user:
-        return jsonify({"error": "Accès non autorisé"}), 401
-
-    try:
-        # Vérifier si le club existe
-        club = Club.query.get(club_id)
-        if not club:
-            return jsonify({"error": "Club non trouvé"}), 404
-
-        # Récupérer tous les terrains pour ce club
-        courts = Court.query.filter_by(club_id=club_id).all()
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    video = Video.query.get_or_404(video_id)
+    if video.user_id != user.id:
+        return jsonify({'error': 'Accès non autorisé'}), 403
         
-        return jsonify({"courts": [court.to_dict() for court in courts]}), 200
-
+    data = request.get_json()
+    try:
+        if 'title' in data:
+            video.title = data['title']
+        if 'description' in data:
+            video.description = data['description']
+        
+        db.session.commit()
+        return jsonify({'message': 'Vidéo mise à jour', 'video': video.to_dict()}), 200
     except Exception as e:
-        # logger.error(f"Erreur lors de la récupération des terrains pour le club {club_id}: {e}")
-        return jsonify({"error": "Erreur serveur"}), 500
+        db.session.rollback()
+        return jsonify({"error": "Erreur lors de la mise à jour"}), 500

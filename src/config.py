@@ -39,8 +39,11 @@ class DevelopmentConfig(Config):
     DEBUG = True
     CORS_ORIGINS = [
         "http://localhost:5173",
-        "http://127.0.0.1:5173"
+        "http://127.0.0.1:5173",
+        "http://localhost:3000"
     ]
+    SESSION_COOKIE_SECURE = False
+    SESSION_COOKIE_SAMESITE = None  # Pour le développement
 
 
 class ProductionConfig(Config):
