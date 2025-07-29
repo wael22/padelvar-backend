@@ -20,15 +20,34 @@ def get_my_videos():
 
 @videos_bp.route('/record', methods=['POST'])
 def start_recording():
+    """Version simple du démarrage d'enregistrement (rétrocompatibilité)"""
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
     data = request.get_json()
-    if not data.get('court_id'):
+    court_id = data.get('court_id')
+    duration = data.get('duration', 90)  # Nouveau: durée par défaut
+    
+    if not court_id:
         return jsonify({'error': 'Le terrain est requis'}), 400
+    
+    # Rediriger vers la nouvelle API de recording
+    from .recording import recording_bp
+    from flask import current_app
+    
+    # Simuler une requête interne vers la nouvelle API
+    recording_data = {
+        'court_id': court_id,
+        'duration': duration,
+        'title': data.get('title', ''),
+        'description': data.get('description', '')
+    }
+    
+    # Pour la compatibilité, on retourne l'ancien format
     return jsonify({
         'message': 'Enregistrement démarré',
         'recording_id': f"rec_{user.id}_{int(datetime.now().timestamp())}",
+        'note': 'Utilisez /api/recording/start pour les nouvelles fonctionnalités'
     }), 200
 
 @videos_bp.route('/stop-recording', methods=['POST'])

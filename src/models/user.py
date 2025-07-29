@@ -94,12 +94,20 @@ class Court(db.Model):
     qr_code = db.Column(db.String(100), unique=True, nullable=False)
     camera_url = db.Column(db.String(255), nullable=False)
     club_id = db.Column(db.Integer, db.ForeignKey('club.id'), nullable=False)
+    
+    # Nouveau : statut d'occupation pour l'enregistrement
+    is_recording = db.Column(db.Boolean, default=False)
+    current_recording_id = db.Column(db.String(100), nullable=True)
+    
     videos = db.relationship('Video', backref='court', lazy=True)
 
     def to_dict(self):
         return {
             "id": self.id, "name": self.name, "club_id": self.club_id,
-            "camera_url": self.camera_url, "qr_code": self.qr_code
+            "camera_url": self.camera_url, "qr_code": self.qr_code,
+            "is_recording": self.is_recording,
+            "current_recording_id": self.current_recording_id,
+            "available": not self.is_recording
         }
 
 class Video(db.Model):
@@ -116,6 +124,10 @@ class Video(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     court_id = db.Column(db.Integer, db.ForeignKey('court.id'), nullable=True)
+    
+    # Relations (en utilisant les backrefs existants)
+    # user = défini via backref='owner' dans User.videos
+    # court = défini via backref='court' dans Court.videos
 
     def to_dict(self):
         return {
@@ -126,6 +138,78 @@ class Video(db.Model):
             "recorded_at": self.recorded_at.isoformat() if self.recorded_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
+
+class RecordingSession(db.Model):
+    """Modèle pour gérer les sessions d'enregistrement en cours"""
+    __tablename__ = 'recording_session'
+    id = db.Column(db.Integer, primary_key=True)
+    recording_id = db.Column(db.String(100), unique=True, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    court_id = db.Column(db.Integer, db.ForeignKey('court.id'), nullable=False)
+    club_id = db.Column(db.Integer, db.ForeignKey('club.id'), nullable=False)
+    
+    # Durée et timing
+    planned_duration = db.Column(db.Integer, nullable=False)  # en minutes
+    max_duration = db.Column(db.Integer, default=200)  # limite max en minutes
+    start_time = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    end_time = db.Column(db.DateTime, nullable=True)
+    
+    # Statut
+    status = db.Column(db.String(20), default='active')  # active, stopped, completed, expired
+    stopped_by = db.Column(db.String(20), nullable=True)  # player, club, auto
+    
+    # Métadonnées
+    title = db.Column(db.String(200), nullable=True)
+    description = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Relations
+    user = db.relationship('User', backref='recording_sessions')
+    court = db.relationship('Court', backref='recording_sessions')
+    club = db.relationship('Club', backref='recording_sessions')
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'recording_id': self.recording_id,
+            'user_id': self.user_id,
+            'court_id': self.court_id,
+            'club_id': self.club_id,
+            'planned_duration': self.planned_duration,
+            'max_duration': self.max_duration,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'end_time': self.end_time.isoformat() if self.end_time else None,
+            'status': self.status,
+            'stopped_by': self.stopped_by,
+            'title': self.title,
+            'description': self.description,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'elapsed_minutes': self.get_elapsed_minutes(),
+            'remaining_minutes': self.get_remaining_minutes(),
+            'is_expired': self.is_expired()
+        }
+    
+    def get_elapsed_minutes(self):
+        """Calculer le temps écoulé en minutes"""
+        if not self.start_time:
+            return 0
+        end_time = self.end_time or datetime.utcnow()
+        delta = end_time - self.start_time
+        return int(delta.total_seconds() / 60)
+    
+    def get_remaining_minutes(self):
+        """Calculer le temps restant en minutes"""
+        if self.status != 'active':
+            return 0
+        elapsed = self.get_elapsed_minutes()
+        return max(0, self.planned_duration - elapsed)
+    
+    def is_expired(self):
+        """Vérifier si l'enregistrement a expiré"""
+        if self.status != 'active':
+            return False
+        elapsed = self.get_elapsed_minutes()
+        return elapsed >= self.planned_duration
 
 class ClubActionHistory(db.Model):
     __tablename__ = 'club_action_history'

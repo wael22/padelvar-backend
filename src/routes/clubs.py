@@ -3,7 +3,12 @@ from src.models.user import db, User, Club, Court, UserRole, ClubActionHistory, 
 from datetime import datetime, timedelta
 import json
 import random
+import logging
 from werkzeug.security import generate_password_hash
+from sqlalchemy.orm import joinedload
+
+# Logger pour tracer les actions
+logger = logging.getLogger(__name__)
 
 # Définition du blueprint pour les routes des clubs
 clubs_bp = Blueprint('clubs', __name__)
@@ -232,22 +237,61 @@ def get_club_dashboard():
         for player in players[:3]:
             print(f"  Joueur: {player.name} (ID: {player.id}, club_id: {player.club_id})")
         
-        # 2. Compter les terrains du club - Méthode similaire à admin.py
+        # 2. Compter les terrains du club et vérifier leur statut d'occupation
         courts = Court.query.filter_by(club_id=club.id).all()
         courts_count = len(courts)
         print(f"Nombre de terrains: {courts_count}")
         
-        # Debug: afficher les terrains trouvés
+        # NOTE: Ne pas nettoyer automatiquement les sessions expirées ici
+        # pour permettre de voir les terrains "Occupé" même quand ils viennent d'expirer
+        # Le nettoyage se fera dans d'autres endpoints
+        # from src.routes.recording import cleanup_expired_sessions
+        # try:
+        #     cleanup_expired_sessions()
+        # except Exception as e:
+        #     print(f"Erreur lors du nettoyage des sessions expirées: {e}")
+        
+        # Enrichir les informations des terrains avec le statut d'occupation
+        courts_with_status = []
         for court in courts:
-            print(f"  Terrain: {court.name} (ID: {court.id}, club_id: {court.club_id})")
+            court_dict = court.to_dict()
+            
+            # Vérifier s'il y a un enregistrement actif sur ce terrain
+            from src.models.user import RecordingSession
+            active_recording = RecordingSession.query.filter_by(
+                court_id=court.id,
+                status='active'
+            ).first()
+            
+            if active_recording and not active_recording.is_expired():
+                court_dict.update({
+                    'is_occupied': True,
+                    'occupation_status': 'Occupé - Enregistrement en cours',
+                    'recording_player': active_recording.user.name if active_recording.user else 'Joueur inconnu',
+                    'recording_remaining': active_recording.get_remaining_minutes(),
+                    'recording_total': active_recording.planned_duration
+                })
+            else:
+                court_dict.update({
+                    'is_occupied': False,
+                    'occupation_status': 'Disponible',
+                    'recording_player': None,
+                    'recording_remaining': None,
+                    'recording_total': None
+                })
+            
+            courts_with_status.append(court_dict)
+            print(f"  Terrain: {court.name} (ID: {court.id}) - {court_dict['occupation_status']}")
+        
+        courts = courts_with_status
         
         # 3. Compter les vidéos - Requête similaire à admin.py avec jointures explicites
-        court_ids = [court.id for court in courts]
+        court_ids = [court_data['id'] if isinstance(court_data, dict) else court_data.id for court_data in courts]
         videos_count = 0
         
         if court_ids:
-            # Utiliser une requête similaire à celle d'admin.py
-            videos = db.session.query(Video).join(Court, Video.court_id == Court.id).filter(
+            # Utiliser une requête avec joinedload pour éviter le problème N+1
+            videos = db.session.query(Video).options(joinedload(Video.owner)).join(Court, Video.court_id == Court.id).filter(
                 Court.club_id == club.id
             ).all()
             videos_count = len(videos)
@@ -255,8 +299,10 @@ def get_club_dashboard():
             # Debug: afficher les vidéos trouvées
             print(f"Nombre de vidéos: {videos_count}")
             for video in videos[:3]:
-                print(f"  Vidéo: {video.title} (ID: {video.id}, court_id: {video.court_id})")
+                player_name = video.owner.name if video.owner else 'Joueur inconnu'
+                print(f"  Vidéo: {video.title} (ID: {video.id}, joueur: {player_name})")
         else:
+            videos = []
             print("Aucun terrain trouvé, donc aucune vidéo")
         
         # 4. Compter les followers - Correction de la méthode
@@ -334,12 +380,24 @@ def get_club_dashboard():
         
         print(f"Statistiques finales: {stats}")
         
+        # Enrichir les vidéos avec le nom du joueur
+        videos_enriched = []
+        if videos:
+            for video in videos:
+                video_dict = video.to_dict()
+                # Ajouter le nom du joueur
+                if video.owner:
+                    video_dict['player_name'] = video.owner.name
+                else:
+                    video_dict['player_name'] = 'Joueur inconnu'
+                videos_enriched.append(video_dict)
+        
         return jsonify({
             'club': club.to_dict(),
             'stats': stats,
             'players': [player.to_dict() for player in players],  # Ajouter les joueurs pour le frontend
-            'courts': [court.to_dict() for court in courts],      # Ajouter les terrains pour le frontend
-            'videos': [video.to_dict() for video in videos] if courts else [],  # Ajouter les vidéos pour le frontend
+            'courts': courts,      # Ajouter les terrains avec statut d'occupation pour le frontend
+            'videos': videos_enriched,  # Vidéos enrichies avec nom du joueur
             'debug_info': {
                 'user_id': user.id,
                 'club_id': user.club_id,
@@ -624,11 +682,24 @@ def get_club_videos():
         courts = Court.query.filter_by(club_id=club.id).all()
         court_ids = [court.id for court in courts]
         
-        # Récupérer les vidéos enregistrées sur ces terrains
+        # Récupérer les vidéos enregistrées sur ces terrains avec joinedload pour optimiser
         from src.models.user import Video
-        videos = Video.query.filter(Video.court_id.in_(court_ids)).order_by(Video.recorded_at.desc()).all() if court_ids else []
+        from sqlalchemy.orm import joinedload
         
-        return jsonify({'videos': [video.to_dict() for video in videos]}), 200
+        videos = Video.query.options(joinedload(Video.owner)).filter(Video.court_id.in_(court_ids)).order_by(Video.recorded_at.desc()).all() if court_ids else []
+        
+        # Enrichir les vidéos avec le nom du joueur
+        videos_enriched = []
+        for video in videos:
+            video_dict = video.to_dict()
+            # Ajouter le nom du joueur
+            if video.owner:
+                video_dict['player_name'] = video.owner.name
+            else:
+                video_dict['player_name'] = 'Joueur inconnu'
+            videos_enriched.append(video_dict)
+        
+        return jsonify({'videos': videos_enriched}), 200
         
     except Exception as e:
         print(f"Erreur lors de la récupération des vidéos: {e}")
@@ -1262,3 +1333,116 @@ def update_club_profile():
         db.session.rollback()
         print(f"Erreur lors de la mise à jour du profil: {e}")
         return jsonify({'error': 'Erreur lors de la mise à jour du profil'}), 500
+
+# Route pour arrêter un enregistrement depuis le dashboard club
+@clubs_bp.route('/courts/<int:court_id>/stop-recording', methods=['POST'])
+def stop_court_recording(court_id):
+    """
+    Permet à un club d'arrêter l'enregistrement en cours sur un terrain spécifique
+    """
+    try:
+        user = get_current_user()
+        if not user:
+            return jsonify({'error': 'Non authentifié'}), 401
+        
+        if user.role != UserRole.CLUB:
+            return jsonify({'error': 'Seuls les clubs peuvent arrêter les enregistrements'}), 403
+        
+        # Vérifier que le terrain appartient au club
+        court = Court.query.get_or_404(court_id)
+        if court.club_id != user.club.id:
+            return jsonify({'error': 'Ce terrain ne vous appartient pas'}), 403
+        
+        # Importer les classes nécessaires
+        from src.models.user import RecordingSession, Video
+        
+        # Trouver l'enregistrement actif sur ce terrain
+        active_recording = RecordingSession.query.filter_by(
+            court_id=court_id,
+            status='active'
+        ).first()
+        
+        if not active_recording:
+            return jsonify({'error': 'Aucun enregistrement actif sur ce terrain'}), 404
+        
+        # Arrêter l'enregistrement
+        active_recording.status = 'stopped'
+        active_recording.end_time = datetime.utcnow()
+        active_recording.stopped_by = 'club'
+        
+        # IMPORTANT: Libérer le terrain pour que le joueur le voit comme disponible
+        court.is_recording = False
+        court.current_recording_id = None
+        
+        # Calculer la durée de l'enregistrement avec debug
+        start_time = active_recording.start_time
+        end_time = active_recording.end_time
+        
+        print(f"DEBUG - Calcul durée:")
+        print(f"  Start time: {start_time}")
+        print(f"  End time: {end_time}")
+        
+        if start_time and end_time:
+            duration_delta = end_time - start_time
+            duration_seconds = duration_delta.total_seconds()
+            duration_minutes = max(1, int(duration_seconds / 60))  # Minimum 1 minute
+            
+            print(f"  Durée en secondes: {duration_seconds}")
+            print(f"  Durée en minutes: {duration_minutes}")
+        else:
+            # Fallback si les dates sont nulles
+            duration_minutes = 1
+            print(f"  Fallback: durée fixée à 1 minute")
+        
+        # Créer automatiquement une vidéo pour le joueur
+        video_title = active_recording.title or f"Match du {active_recording.start_time.strftime('%d/%m/%Y')} - {court.name}"
+        
+        new_video = Video(
+            title=video_title,
+            description=active_recording.description or f"Enregistrement automatique sur {court.name}",
+            duration=duration_minutes,
+            user_id=active_recording.user_id,
+            court_id=court_id,
+            recorded_at=active_recording.start_time,
+            is_unlocked=True,  # Vidéo débloquée automatiquement
+            credits_cost=0     # Pas de coût puisque l'enregistrement a été arrêté par le club
+        )
+        
+        db.session.add(new_video)
+        
+        # Log de l'action d'arrêt par le club
+        try:
+            action_history = ClubActionHistory(
+                club_id=user.club.id,
+                user_id=active_recording.user_id,
+                action_type='stop_recording',
+                action_details=json.dumps({
+                    'stopped_by': 'club',
+                    'duration_minutes': duration_minutes,
+                    'court_name': court.name,
+                    'video_title': new_video.title,
+                    'recording_id': active_recording.recording_id
+                }),
+                performed_by_id=user.id,
+                performed_at=datetime.utcnow()
+            )
+            db.session.add(action_history)
+            logger.info(f"Club {user.club.name} a arrêté l'enregistrement {active_recording.recording_id}")
+        except Exception as log_error:
+            logger.warning(f"Erreur lors du log d'action: {log_error}")
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Enregistrement arrêté avec succès et vidéo créée',
+            'recording_id': active_recording.id,
+            'video_id': new_video.id,
+            'video_title': new_video.title,
+            'duration_minutes': duration_minutes,
+            'court_id': court_id
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Erreur lors de l'arrêt de l'enregistrement: {e}")
+        return jsonify({'error': 'Erreur lors de l\'arrêt de l\'enregistrement'}), 500

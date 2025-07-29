@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PadelVar - Test d'authentification</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .container { background: #f5f5f5; padding: 20px; border-radius: 8px; }
+        .success { color: green; }
+        .error { color: red; }
+        .info { color: blue; }
+        button { padding: 10px 20px; margin: 5px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        pre { background: #fff; padding: 10px; border-radius: 4px; overflow-x: auto; }
+        .status { margin: 10px 0; padding: 10px; border-radius: 4px; }
+        .status.success { background: #d4edda; border: 1px solid #c3e6cb; }
+        .status.error { background: #f8d7da; border: 1px solid #f5c6cb; }
+        .status.info { background: #d1ecf1; border: 1px solid #bee5eb; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 PadelVar - Test d'authentification</h1>
+        
+        <div id="status"></div>
+        
+        <div>
+            <h3>🔐 Connexion</h3>
+            <button onclick="testLogin()">Se connecter (player@test.com)</button>
+            <button onclick="testLogout()">Se déconnecter</button>
+        </div>
+        
+        <div>
+            <h3>🛠️ Routes de debug</h3>
+            <button onclick="testDebugSession()">Debug Session</button>
+            <button onclick="testDebugAuth()">Debug Auth</button>
+        </div>
+        
+        <div>
+            <h3>🎯 Routes players</h3>
+            <button onclick="testClubsAvailable()">Clubs disponibles</button>
+            <button onclick="testClubsFollowed()">Clubs suivis</button>
+            <button onclick="testDashboard()">Dashboard</button>
+        </div>
+        
+        <div>
+            <h3>📊 Résultats</h3>
+            <pre id="results"></pre>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:5000';
+        
+        function logResult(message, type = 'info') {
+            const results = document.getElementById('results');
+            const timestamp = new Date().toLocaleTimeString();
+            results.textContent += `[${timestamp}] ${message}\n`;
+            
+            const status = document.getElementById('status');
+            status.className = `status ${type}`;
+            status.textContent = message;
+        }
+        
+        async function apiCall(endpoint, options = {}) {
+            try {
+                const response = await fetch(`${API_BASE}${endpoint}`, {
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    },
+                    ...options
+                });
+                
+                const data = await response.json();
+                return { status: response.status, data };
+            } catch (error) {
+                return { status: 0, error: error.message };
+            }
+        }
+        
+        async function testLogin() {
+            logResult('🔐 Test de connexion...', 'info');
+            const result = await apiCall('/api/auth/login', {
+                method: 'POST',
+                body: JSON.stringify({
+                    email: 'player@test.com',
+                    password: 'password123'
+                })
+            });
+            
+            if (result.status === 200) {
+                logResult(`✅ Connexion réussie: ${result.data.user?.name}`, 'success');
+            } else {
+                logResult(`❌ Échec connexion (${result.status}): ${result.error || JSON.stringify(result.data)}`, 'error');
+            }
+        }
+        
+        async function testLogout() {
+            logResult('🚪 Déconnexion...', 'info');
+            const result = await apiCall('/api/auth/logout', { method: 'POST' });
+            
+            if (result.status === 200) {
+                logResult('✅ Déconnexion réussie', 'success');
+            } else {
+                logResult(`❌ Échec déconnexion (${result.status})`, 'error');
+            }
+        }
+        
+        async function testDebugSession() {
+            logResult('🛠️ Test debug session...', 'info');
+            const result = await apiCall('/api/players/debug/session');
+            
+            if (result.status === 200) {
+                logResult(`✅ Session debug: ${JSON.stringify(result.data, null, 2)}`, 'success');
+            } else {
+                logResult(`❌ Échec session debug (${result.status}): ${result.error || JSON.stringify(result.data)}`, 'error');
+            }
+        }
+        
+        async function testDebugAuth() {
+            logResult('🛠️ Test debug auth...', 'info');
+            const result = await apiCall('/api/players/debug/auth');
+            
+            if (result.status === 200) {
+                logResult(`✅ Auth debug: ${JSON.stringify(result.data, null, 2)}`, 'success');
+            } else {
+                logResult(`❌ Échec auth debug (${result.status}): ${result.error || JSON.stringify(result.data)}`, 'error');
+            }
+        }
+        
+        async function testClubsAvailable() {
+            logResult('🏟️ Test clubs disponibles...', 'info');
+            const result = await apiCall('/api/players/clubs/available');
+            
+            if (result.status === 200) {
+                logResult(`✅ Clubs disponibles: ${result.data.clubs?.length || 0} clubs`, 'success');
+            } else {
+                logResult(`❌ Échec clubs disponibles (${result.status}): ${result.error || JSON.stringify(result.data)}`, 'error');
+            }
+        }
+        
+        async function testClubsFollowed() {
+            logResult('💖 Test clubs suivis...', 'info');
+            const result = await apiCall('/api/players/clubs/followed');
+            
+            if (result.status === 200) {
+                logResult(`✅ Clubs suivis: ${result.data.clubs?.length || 0} clubs`, 'success');
+            } else {
+                logResult(`❌ Échec clubs suivis (${result.status}): ${result.error || JSON.stringify(result.data)}`, 'error');
+            }
+        }
+        
+        async function testDashboard() {
+            logResult('📊 Test dashboard...', 'info');
+            const result = await apiCall('/api/players/dashboard');
+            
+            if (result.status === 200) {
+                logResult(`✅ Dashboard accessible`, 'success');
+            } else {
+                logResult(`❌ Échec dashboard (${result.status}): ${result.error || JSON.stringify(result.data)}`, 'error');
+            }
+        }
+        
+        // Test initial
+        window.onload = function() {
+            logResult('🎯 Page de test chargée. Commencez par vous connecter.', 'info');
+        };
+    </script>
+</body>
+</html>

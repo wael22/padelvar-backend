@@ -19,6 +19,7 @@ from .routes.clubs import clubs_bp
 from .routes.frontend import frontend_bp
 from .routes.all_clubs import all_clubs_bp
 from .routes.players import players_bp
+from .routes.recording import recording_bp
 
 def create_app(config_name=None):
     """
@@ -79,6 +80,26 @@ def create_app(config_name=None):
     app.register_blueprint(frontend_bp)
     app.register_blueprint(all_clubs_bp, url_prefix='/api/all-clubs')
     app.register_blueprint(players_bp, url_prefix='/api/players')
+    app.register_blueprint(recording_bp, url_prefix='/api/recording')
+    
+    # Route de test pour le développement
+    if config_name == 'development':
+        @app.route('/test')
+        def test_page():
+            """Page de test d'authentification"""
+            from flask import send_from_directory
+            import os
+            test_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'test_auth.html')
+            if os.path.exists(test_file_path):
+                return send_from_directory(os.path.dirname(test_file_path), 'test_auth.html')
+            else:
+                return """
+                <html><body>
+                <h1>Page de test PadelVar</h1>
+                <p>Fichier test_auth.html non trouvé.</p>
+                <p>Essayez d'accéder directement au fichier test_auth.html dans le répertoire backend.</p>
+                </body></html>
+                """
     
     # Routes de base
     @app.route('/api/health')
