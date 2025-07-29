@@ -141,22 +141,32 @@ def get_available_clubs():
         return jsonify({"error": "Accès non autorisé"}), 403
     
     try:
-        # Optimisation: requête simple pour éviter les problèmes avec dynamic relationships
+        # Requête simple et sûre
         clubs_query = db.session.query(Club).all()
         
-        # Les followed_clubs est une requête dynamique
-        followed_ids = {c.id for c in user.followed_clubs.all()}
+        # Requête des clubs suivis de manière sécurisée
+        try:
+            followed_ids = {c.id for c in user.followed_clubs.all()}
+        except Exception as e:
+            logger.warning(f"Erreur avec followed_clubs: {e}")
+            followed_ids = set()
         
         clubs_data = []
         for club in clubs_query:
             club_dict = club.to_dict()
             club_dict["is_followed"] = club.id in followed_ids
-            # Pour les dynamic relationships, utiliser count() au lieu de len()
-            club_dict["followers_count"] = club.followers.count()
-            club_dict["courts_count"] = len(club.courts) if hasattr(club, 'courts') else 0
+            
+            # Compter les followers de manière sécurisée
+            try:
+                club_dict["followers_count"] = club.followers.count()
+            except Exception:
+                club_dict["followers_count"] = 0
+                
+            # Compter les courts
+            club_dict["courts_count"] = len(club.courts) if hasattr(club, 'courts') and club.courts else 0
             clubs_data.append(club_dict)
         
-        # Trier par popularité (nombre de followers)
+        # Trier par popularité
         clubs_data.sort(key=lambda x: x.get("followers_count", 0), reverse=True)
         
         logger.info(f"Clubs disponibles récupérés pour le joueur {user.id}")
@@ -168,6 +178,7 @@ def get_available_clubs():
         
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des clubs disponibles: {e}")
+        return jsonify({"error": f"Erreur serveur: {str(e)}"}), 500
         return jsonify({"error": "Erreur lors de la récupération des clubs"}), 500
 
 @players_bp.route("/clubs/<int:club_id>/follow", methods=["POST"])
@@ -310,25 +321,40 @@ def get_followed_clubs():
     try:
         followed_clubs_data = []
         
-        for club in user.followed_clubs.all():  # .all() pour dynamic relationship
+        # Requête sécurisée des clubs suivis
+        try:
+            followed_clubs = user.followed_clubs.all()
+        except Exception as e:
+            logger.warning(f"Erreur avec followed_clubs: {e}")
+            followed_clubs = []
+        
+        for club in followed_clubs:
             club_dict = club.to_dict()
             
-            # Ajouter des statistiques enrichies
-            club_dict["courts_count"] = len(club.courts) if hasattr(club, 'courts') else 0
-            club_dict["followers_count"] = club.followers.count()  # count() pour dynamic relationship
+            # Ajouter des statistiques enrichies de manière sécurisée
+            club_dict["courts_count"] = len(club.courts) if hasattr(club, 'courts') and club.courts else 0
+            
+            try:
+                club_dict["followers_count"] = club.followers.count()
+            except Exception:
+                club_dict["followers_count"] = 0
+                
             club_dict["is_primary_club"] = (user.club_id == club.id)
             
             # Dernière activité du joueur dans ce club
-            last_activity = ClubActionHistory.query.filter_by(
-                club_id=club.id,
-                user_id=user.id
-            ).order_by(desc(ClubActionHistory.performed_at)).first()
-            
-            if last_activity:
-                club_dict["last_activity"] = {
-                    "action_type": last_activity.action_type,
-                    "performed_at": last_activity.performed_at.isoformat()
-                }
+            try:
+                last_activity = ClubActionHistory.query.filter_by(
+                    club_id=club.id,
+                    user_id=user.id
+                ).order_by(desc(ClubActionHistory.performed_at)).first()
+                
+                if last_activity:
+                    club_dict["last_activity"] = {
+                        "action_type": last_activity.action_type,
+                        "performed_at": last_activity.performed_at.isoformat()
+                    }
+            except Exception:
+                pass
             
             followed_clubs_data.append(club_dict)
         

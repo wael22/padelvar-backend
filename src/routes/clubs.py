@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, session
-from src.models.user import db, User, Club, Court, UserRole, ClubActionHistory, Video
+from src.models.user import db, User, Club, Court, UserRole, ClubActionHistory, Video, RecordingSession
 from datetime import datetime, timedelta
 import json
 import random
@@ -257,7 +257,6 @@ def get_club_dashboard():
             court_dict = court.to_dict()
             
             # Vérifier s'il y a un enregistrement actif sur ce terrain
-            from src.models.user import RecordingSession
             active_recording = RecordingSession.query.filter_by(
                 court_id=court.id,
                 status='active'

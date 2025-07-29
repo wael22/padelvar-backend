@@ -97,6 +97,7 @@ class Court(db.Model):
     
     # Nouveau : statut d'occupation pour l'enregistrement
     is_recording = db.Column(db.Boolean, default=False)
+    recording_session_id = db.Column(db.String(100), nullable=True)
     current_recording_id = db.Column(db.String(100), nullable=True)
     
     videos = db.relationship('Video', backref='court', lazy=True)
@@ -106,6 +107,7 @@ class Court(db.Model):
             "id": self.id, "name": self.name, "club_id": self.club_id,
             "camera_url": self.camera_url, "qr_code": self.qr_code,
             "is_recording": self.is_recording,
+            "recording_session_id": self.recording_session_id,
             "current_recording_id": self.current_recording_id,
             "available": not self.is_recording
         }
@@ -118,6 +120,7 @@ class Video(db.Model):
     file_url = db.Column(db.String(255), nullable=True)
     thumbnail_url = db.Column(db.String(255), nullable=True)
     duration = db.Column(db.Integer, nullable=True)
+    file_size = db.Column(db.Integer, nullable=True)  # Taille du fichier en octets
     is_unlocked = db.Column(db.Boolean, default=True)
     credits_cost = db.Column(db.Integer, default=1)
     recorded_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -134,7 +137,7 @@ class Video(db.Model):
             "id": self.id, "user_id": self.user_id, "court_id": self.court_id,
             "file_url": self.file_url, "thumbnail_url": self.thumbnail_url,
             "title": self.title, "description": self.description, "duration": self.duration,
-            "is_unlocked": self.is_unlocked, "credits_cost": self.credits_cost,
+            "file_size": self.file_size, "is_unlocked": self.is_unlocked, "credits_cost": self.credits_cost,
             "recorded_at": self.recorded_at.isoformat() if self.recorded_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }

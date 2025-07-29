@@ -1,7 +1,12 @@
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, request, jsonify, session, send_file, Response
 from src.models.user import db, User, Video, Court, Club
-from datetime import datetime
+from src.services.video_capture_service import video_capture_service
+from datetime import datetime, timedelta
+import os
+import io
+import logging
 
+logger = logging.getLogger(__name__)
 videos_bp = Blueprint('videos', __name__)
 
 def get_current_user():
@@ -15,67 +20,162 @@ def get_my_videos():
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
-    videos = Video.query.filter_by(user_id=user.id).order_by(Video.recorded_at.desc()).all()
-    return jsonify({'videos': [v.to_dict() for v in videos]}), 200
+    
+    try:
+        videos = Video.query.filter_by(user_id=user.id).order_by(Video.recorded_at.desc()).all()
+        
+        # Créer une version sécurisée du to_dict()
+        videos_data = []
+        for video in videos:
+            video_dict = {
+                "id": video.id,
+                "title": video.title,
+                "description": video.description,
+                "file_url": video.file_url,
+                "thumbnail_url": video.thumbnail_url,
+                "duration": getattr(video, 'duration', None),
+                "file_size": getattr(video, 'file_size', None),
+                "is_unlocked": getattr(video, 'is_unlocked', True),
+                "credits_cost": getattr(video, 'credits_cost', 1),
+                "recorded_at": video.recorded_at.isoformat() if video.recorded_at else None,
+                "created_at": video.created_at.isoformat() if video.created_at else None,
+                "user_id": video.user_id,
+                "court_id": video.court_id
+            }
+            videos_data.append(video_dict)
+        
+        return jsonify({'videos': videos_data}), 200
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des vidéos: {e}")
+        return jsonify({'error': 'Erreur lors de la récupération des vidéos'}), 500
 
 @videos_bp.route('/record', methods=['POST'])
 def start_recording():
-    """Version simple du démarrage d'enregistrement (rétrocompatibilité)"""
+    """Démarrage d'enregistrement avec service de capture vidéo"""
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
+    
     data = request.get_json()
     court_id = data.get('court_id')
-    duration = data.get('duration', 90)  # Nouveau: durée par défaut
+    session_name = data.get('session_name', f"Match du {datetime.now().strftime('%d/%m/%Y')}")
     
     if not court_id:
         return jsonify({'error': 'Le terrain est requis'}), 400
     
-    # Rediriger vers la nouvelle API de recording
-    from .recording import recording_bp
-    from flask import current_app
-    
-    # Simuler une requête interne vers la nouvelle API
-    recording_data = {
-        'court_id': court_id,
-        'duration': duration,
-        'title': data.get('title', ''),
-        'description': data.get('description', '')
-    }
-    
-    # Pour la compatibilité, on retourne l'ancien format
-    return jsonify({
-        'message': 'Enregistrement démarré',
-        'recording_id': f"rec_{user.id}_{int(datetime.now().timestamp())}",
-        'note': 'Utilisez /api/recording/start pour les nouvelles fonctionnalités'
-    }), 200
+    try:
+        # Vérifier que le terrain existe
+        court = Court.query.get(court_id)
+        if not court:
+            return jsonify({'error': 'Terrain non trouvé'}), 400
+        
+        # Vérifier que le terrain n'est pas déjà en cours d'enregistrement
+        if hasattr(court, 'is_recording') and court.is_recording:
+            return jsonify({'error': 'Ce terrain est déjà en cours d\'enregistrement'}), 400
+        
+        # Démarrer l'enregistrement avec le service de capture
+        result = video_capture_service.start_recording(
+            court_id=court_id,
+            user_id=user.id,
+            session_name=session_name
+        )
+        
+        # Marquer le terrain comme en cours d'enregistrement
+        court.is_recording = True
+        court.recording_session_id = result['session_id']
+        db.session.commit()
+        
+        logger.info(f"Enregistrement démarré par utilisateur {user.id} sur terrain {court_id}")
+        
+        return jsonify({
+            'message': 'Enregistrement démarré avec succès',
+            'session_id': result['session_id'],
+            'court_id': court_id,
+            'session_name': session_name,
+            'camera_url': result['camera_url'],
+            'status': 'recording'
+        }), 200
+        court.is_recording = True
+        court.current_recording_id = recording_id
+        
+        # Créer une session d'enregistrement (si vous utilisez l'API avancée)
+        try:
+            from src.models.user import RecordingSession
+            recording_session = RecordingSession(
+                recording_id=recording_id,
+                user_id=user.id,
+                court_id=court_id,
+                club_id=court.club_id,
+                planned_duration=duration,
+                status='recording',
+                start_time=datetime.utcnow()
+            )
+            db.session.add(recording_session)
+        except ImportError:
+            # Si RecordingSession n'existe pas, on continue sans
+            pass
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Enregistrement démarré avec succès',
+            'recording_id': recording_id,
+            'court': court.to_dict(),
+            'duration': duration,
+            'estimated_end_time': (datetime.now() + timedelta(minutes=duration)).isoformat(),
+            'camera_url': court.camera_url
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Erreur lors du démarrage: {str(e)}'}), 500
 
 @videos_bp.route('/stop-recording', methods=['POST'])
 def stop_recording():
+    """Arrêter l'enregistrement avec service de capture vidéo"""
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Non authentifié'}), 401
-    if user.credits_balance < 1:
-        return jsonify({'error': 'Crédits insuffisants'}), 400
+    
     data = request.get_json()
+    session_id = data.get('session_id')
     court_id = data.get('court_id')
-    if not court_id:
-        return jsonify({'error': 'court_id manquant'}), 400
+    
+    if not session_id:
+        return jsonify({'error': 'session_id manquant'}), 400
+    
     try:
-        user.credits_balance -= 1
-        new_video = Video(
-            user_id=user.id,
-            court_id=court_id,
-            file_url=f'/videos/simulated_{data.get("recording_id")}.mp4',
-            title=data.get('title') or f'Match du {datetime.now().strftime("%d/%m/%Y")}',
-            description=data.get('description', '')
-        )
-        db.session.add(new_video)
-        db.session.commit()
-        return jsonify({'message': 'Vidéo sauvegardée', 'video': new_video.to_dict()}), 201
+        # Arrêter l'enregistrement avec le service de capture
+        result = video_capture_service.stop_recording(session_id)
+        
+        if result.get('status') == 'error':
+            return jsonify({'error': result.get('error', 'Erreur lors de l\'arrêt')}), 500
+        
+        # Mettre à jour le terrain
+        if court_id:
+            court = Court.query.get(court_id)
+            if court:
+                court.is_recording = False
+                court.recording_session_id = None
+                db.session.commit()
+        
+        logger.info(f"Enregistrement arrêté par utilisateur {user.id}: {session_id}")
+        
+        return jsonify({
+            'message': 'Enregistrement arrêté avec succès',
+            'session_id': session_id,
+            'status': result.get('status'),
+            'video_id': result.get('video_id'),
+            'video_filename': result.get('video_filename'),
+            'duration': result.get('duration'),
+            'file_size': result.get('file_size')
+        }), 200
+        
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "Erreur lors de l'arrêt"}), 500
+        logger.error(f"Erreur lors de l'arrêt de l'enregistrement: {e}")
+        return jsonify({"error": f"Erreur lors de l'arrêt: {str(e)}"}), 500
 
 @videos_bp.route('/<int:video_id>', methods=['DELETE'])
 def delete_video(video_id):
@@ -283,3 +383,189 @@ def update_video(video_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "Erreur lors de la mise à jour"}), 500
+
+
+# ====================================================================
+# ENDPOINTS POUR SERVIR LES VIDÉOS ET THUMBNAILS
+# ====================================================================
+
+@videos_bp.route('/stream/<filename>', methods=['GET'])
+def stream_video(filename):
+    """Servir les fichiers vidéo (simulation pour le MVP)"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    try:
+        # Pour le MVP, on génère une vidéo de test
+        # Dans la vraie implémentation, on servirait le fichier réel
+        
+        # Créer une réponse de stream vidéo simulée
+        def generate_fake_video():
+            # Données de test pour simuler une vidéo MP4
+            # En production, on lirait le vrai fichier
+            fake_video_data = b'\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom' + b'\x00' * 1000
+            yield fake_video_data
+        
+        return Response(
+            generate_fake_video(),
+            mimetype='video/mp4',
+            headers={
+                'Content-Disposition': f'inline; filename="{filename}"',
+                'Accept-Ranges': 'bytes',
+                'Content-Length': '1024'
+            }
+        )
+    except Exception as e:
+        return jsonify({'error': 'Erreur lors du streaming vidéo'}), 500
+
+@videos_bp.route('/thumbnail/<filename>', methods=['GET'])
+def get_thumbnail(filename):
+    """Servir les thumbnails (simulation pour le MVP)"""
+    try:
+        # Pour le MVP, on génère une image de placeholder
+        # Dans la vraie implémentation, on servirait la vraie thumbnail
+        
+        # Créer une image placeholder simple (1x1 pixel transparent PNG)
+        placeholder_png = (
+            b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x01\x00\x00\x00\x007n\xf9$\x00\x00\x00\nIDATx\x9cc\xf8\x00\x00\x00\x01\x00\x01U\r\r\x82\x00\x00\x00\x00IEND\xaeB`\x82'
+        )
+        
+        return Response(
+            placeholder_png,
+            mimetype='image/png',
+            headers={
+                'Content-Disposition': f'inline; filename="{filename}"',
+                'Cache-Control': 'public, max-age=3600'
+            }
+        )
+    except Exception as e:
+        return jsonify({'error': 'Erreur lors du chargement de la thumbnail'}), 500
+
+@videos_bp.route('/download/<int:video_id>', methods=['GET'])
+def download_video(video_id):
+    """Télécharger une vidéo"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    try:
+        video = Video.query.get(video_id)
+        if not video:
+            return jsonify({'error': 'Vidéo non trouvée'}), 404
+        
+        # Vérifier les permissions
+        if video.user_id != user.id and not video.is_unlocked:
+            return jsonify({'error': 'Accès non autorisé'}), 403
+        
+        # Pour le MVP, rediriger vers le stream
+        filename = video.file_url.split('/')[-1]
+        return Response(
+            b'fake video data for download',
+            mimetype='video/mp4',
+            headers={
+                'Content-Disposition': f'attachment; filename="{video.title}.mp4"',
+                'Content-Type': 'application/octet-stream'
+            }
+        )
+    except Exception as e:
+        return jsonify({'error': 'Erreur lors du téléchargement'}), 500
+
+
+# ====================================================================
+# ENDPOINTS POUR LA GESTION D'ENREGISTREMENT
+# ====================================================================
+
+@videos_bp.route('/recording/<recording_id>/status', methods=['GET'])
+def get_recording_status_by_id(recording_id):
+    """Obtenir le statut d'un enregistrement en cours avec le service de capture"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    try:
+        # Obtenir le statut depuis le service de capture
+        status = video_capture_service.get_recording_status(recording_id)
+        
+        if 'error' in status:
+            return jsonify(status), 404
+        
+        return jsonify(status), 200
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération du statut: {e}")
+        return jsonify({'error': 'Erreur lors de la récupération du statut'}), 500
+
+@videos_bp.route('/recording/<recording_id>/stop', methods=['POST'])
+def stop_recording_by_id(recording_id):
+    """Arrêter un enregistrement spécifique par son ID avec le service de capture"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    try:
+        # Arrêter l'enregistrement avec le service de capture
+        result = video_capture_service.stop_recording(recording_id)
+        
+        if result.get('status') == 'error':
+            return jsonify({'error': result.get('error', 'Erreur lors de l\'arrêt')}), 500
+        
+        # Mettre à jour le terrain qui était en cours d'enregistrement
+        court = Court.query.filter_by(recording_session_id=recording_id).first()
+        if court:
+            court.is_recording = False
+            court.recording_session_id = None
+            db.session.commit()
+        
+        logger.info(f"Enregistrement arrêté par utilisateur {user.id}: {recording_id}")
+        
+        return jsonify({
+            'message': 'Enregistrement arrêté avec succès',
+            'recording_id': recording_id,
+            'status': result.get('status'),
+            'video_id': result.get('video_id'),
+            'video_filename': result.get('video_filename'),
+            'duration': result.get('duration'),
+            'file_size': result.get('file_size')
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Erreur lors de l'arrêt de l'enregistrement {recording_id}: {e}")
+        return jsonify({'error': f'Erreur lors de l\'arrêt: {str(e)}'}), 500
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Erreur lors de l'arrêt de l'enregistrement {recording_id}: {e}")
+        return jsonify({'error': f'Erreur lors de l\'arrêt: {str(e)}'}), 500
+
+@videos_bp.route('/courts/available', methods=['GET'])
+def get_available_courts():
+    """Obtenir la liste des terrains disponibles pour l'enregistrement"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    try:
+        # Récupérer tous les terrains non occupés
+        courts = Court.query.filter_by(is_recording=False).all()
+        
+        # Grouper par club
+        courts_by_club = {}
+        for court in courts:
+            club = Club.query.get(court.club_id)
+            if club:
+                if club.id not in courts_by_club:
+                    courts_by_club[club.id] = {
+                        'club': club.to_dict(),
+                        'courts': []
+                    }
+                courts_by_club[club.id]['courts'].append(court.to_dict())
+        
+        return jsonify({
+            'available_courts': list(courts_by_club.values()),
+            'total_available': len(courts)
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Erreur lors de la récupération des terrains: {str(e)}'}), 500

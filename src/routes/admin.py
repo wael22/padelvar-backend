@@ -1,11 +1,10 @@
 # padelvar-backend/src/routes/admin.py
 
 from flask import Blueprint, request, jsonify, session
-from src.models.user import db, User, Club, Court, Video, UserRole, ClubActionHistory
+from src.models.user import db, User, Club, Court, Video, UserRole, ClubActionHistory, RecordingSession
 from werkzeug.security import generate_password_hash
 from sqlalchemy.exc import IntegrityError
-# NOUVEL IMPORT NÉCESSAIRE
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, joinedload
 import uuid
 import logging
 import json
@@ -123,12 +122,64 @@ def delete_user(user_id):
     if not require_super_admin(): return jsonify({"error": "Accès non autorisé"}), 403
     user = User.query.get_or_404(user_id)
     try:
+        print(f"🗑️ Suppression de l'utilisateur ID: {user_id} - {user.name} ({user.email})")
+        
+        # 1. Gérer les vidéos associées
+        videos = Video.query.filter_by(user_id=user_id).all()
+        for video in videos:
+            video.user_id = None  # Rendre orpheline plutôt que supprimer
+            print(f"   📹 Vidéo {video.id} rendue orpheline: user_id -> NULL")
+        
+        # 2. Gérer les sessions d'enregistrement
+        recording_sessions = RecordingSession.query.filter_by(user_id=user_id).all()
+        for session in recording_sessions:
+            print(f"   🎬 Suppression session: {session.recording_id}")
+            db.session.delete(session)
+        
+        # 3. Gérer l'historique des actions
+        history_entries = ClubActionHistory.query.filter_by(user_id=user_id).all()
+        for entry in history_entries:
+            entry.user_id = None  # Garder l'historique mais anonymiser
+            print(f"   📝 Historique {entry.id} anonymisé: user_id -> NULL")
+        
+        # 4. Gérer l'historique où l'utilisateur était le performeur
+        performed_entries = ClubActionHistory.query.filter_by(performed_by_id=user_id).all()
+        for entry in performed_entries:
+            entry.performed_by_id = None
+            print(f"   📝 Historique {entry.id} anonymisé: performed_by_id -> NULL")
+        
+        # 5. Si c'est un utilisateur club, gérer les relations club
+        if user.role == UserRole.CLUB and user.club_id:
+            club = Club.query.get(user.club_id)
+            if club:
+                print(f"   🏢 Utilisateur club détecté pour: {club.name}")
+                # Optionnel: supprimer le club aussi ou le laisser orphelin
+                # Pour l'instant, on le laisse orphelin
+        
+        # 6. Gérer les relations many-to-many (follows)
+        if hasattr(user, 'followed_clubs'):
+            # Pour les relations many-to-many, il faut supprimer les relations explicitement
+            user.followed_clubs = []  # Vider la relation
+            print(f"   🔗 Relations de suivi supprimées")
+        
+        # 7. Supprimer l'utilisateur lui-même
+        print(f"   👤 Suppression de l'utilisateur: {user.name}")
         db.session.delete(user)
+        
         db.session.commit()
-        return jsonify({"message": "Utilisateur supprimé"}), 200
+        
+        return jsonify({
+            "message": "Utilisateur supprimé avec succès",
+            "videos_orphaned": len(videos),
+            "recording_sessions_deleted": len(recording_sessions),
+            "history_entries_anonymized": len(history_entries) + len(performed_entries)
+        }), 200
+        
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "Erreur lors de la suppression"}), 500
+        print(f"❌ Erreur lors de la suppression de l'utilisateur {user_id}: {e}")
+        logger.error(f"Erreur lors de la suppression de l'utilisateur {user_id}: {e}")
+        return jsonify({"error": f"Erreur lors de la suppression: {str(e)}"}), 500
 
 @admin_bp.route("/users/<int:user_id>/credits", methods=["POST"])
 def add_credits(user_id):
@@ -225,14 +276,96 @@ def delete_club(club_id):
     if not require_super_admin(): return jsonify({"error": "Accès non autorisé"}), 403
     club = Club.query.get_or_404(club_id)
     try:
+        # Importer les modèles nécessaires
+        from src.models.user import Video, RecordingSession, ClubActionHistory
+        
+        print(f"🗑️ Suppression du club ID: {club_id} - {club.name}")
+        
+        # 1. Gérer les terrains et leurs contraintes
+        courts = Court.query.filter_by(club_id=club_id).all()
+        videos_orphaned = 0
+        recording_sessions_deleted = 0
+        
+        for court in courts:
+            print(f"   🏟️ Traitement du terrain: {court.name}")
+            
+            # Gérer les vidéos de ce terrain
+            court_videos = Video.query.filter_by(court_id=court.id).all()
+            for video in court_videos:
+                video.court_id = None
+                videos_orphaned += 1
+                print(f"     📹 Vidéo {video.id} rendue orpheline")
+            
+            # Gérer les sessions d'enregistrement de ce terrain
+            court_sessions = RecordingSession.query.filter_by(court_id=court.id).all()
+            for session in court_sessions:
+                print(f"     🎬 Suppression session: {session.recording_id}")
+                db.session.delete(session)
+                recording_sessions_deleted += 1
+        
+        # 2. Supprimer tous les terrains du club
         Court.query.filter_by(club_id=club_id).delete()
+        print(f"   🏟️ {len(courts)} terrain(s) supprimé(s)")
+        
+        # 3. Gérer les utilisateurs du club
+        club_users = User.query.filter_by(club_id=club_id).all()
+        for user in club_users:
+            print(f"   👤 Traitement utilisateur: {user.name} ({user.role.value})")
+            
+            # Gérer les vidéos de cet utilisateur (les rendre orphelines)
+            user_videos = Video.query.filter_by(user_id=user.id).all()
+            for video in user_videos:
+                if video.user_id == user.id:  # Éviter les doublons
+                    video.user_id = None
+                    print(f"     📹 Vidéo {video.id} rendue orpheline")
+            
+            # Gérer les sessions d'enregistrement de cet utilisateur
+            user_sessions = RecordingSession.query.filter_by(user_id=user.id).all()
+            for session in user_sessions:
+                if session not in [s for s in RecordingSession.query.filter_by(court_id=None).all()]:
+                    print(f"     🎬 Suppression session utilisateur: {session.recording_id}")
+                    db.session.delete(session)
+            
+            # Gérer les relations many-to-many (follows)
+            if hasattr(user, 'followed_clubs'):
+                user.followed_clubs = []
+        
+        # 4. Gérer l'historique du club
+        history_entries = ClubActionHistory.query.filter_by(club_id=club_id).all()
+        for entry in history_entries:
+            entry.club_id = None  # Anonymiser plutôt que supprimer
+            print(f"   📝 Historique {entry.id} anonymisé")
+        
+        # 5. Supprimer les utilisateurs du club
         User.query.filter_by(club_id=club_id).delete()
+        print(f"   👤 {len(club_users)} utilisateur(s) supprimé(s)")
+        
+        # 6. Gérer les relations many-to-many avec les followers
+        if hasattr(club, 'followers'):
+            # Supprimer toutes les relations de suivi de ce club
+            club.followers = []
+            print(f"   🔗 Relations de suivi du club supprimées")
+        
+        # 7. Supprimer le club lui-même
+        print(f"   🏢 Suppression du club: {club.name}")
         db.session.delete(club)
+        
         db.session.commit()
-        return jsonify({"message": "Club supprimé"}), 200
+        
+        return jsonify({
+            "message": "Club supprimé avec succès",
+            "courts_deleted": len(courts),
+            "users_deleted": len(club_users),
+            "videos_orphaned": videos_orphaned,
+            "recording_sessions_deleted": recording_sessions_deleted,
+            "history_entries_anonymized": len(history_entries)
+        }), 200
+        
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "Erreur lors de la suppression"}), 500
+        print(f"❌ Erreur lors de la suppression du club {club_id}: {e}")
+        logger.error(f"Erreur lors de la suppression du club {club_id}: {e}")
+        return jsonify({"error": f"Erreur lors de la suppression: {str(e)}"}), 500
 
 # --- ROUTES DE GESTION DES TERRAINS (CRUD COMPLET) ---
 
@@ -274,9 +407,6 @@ def delete_court(court_id):
     if not require_super_admin(): return jsonify({"error": "Accès non autorisé"}), 403
     court = Court.query.get_or_404(court_id)
     try:
-        # Importer les modèles nécessaires
-        from src.models.user import Video, RecordingSession
-        
         print(f"🗑️ Suppression du terrain ID: {court_id} - {court.name}")
         
         # 1. Gérer les vidéos associées (les déplacer vers NULL)
@@ -312,28 +442,64 @@ def delete_court(court_id):
 
 @admin_bp.route("/videos", methods=["GET"])
 def get_all_clubs_videos():
-    if not require_super_admin(): return jsonify({"error": "Accès non autorisé"}), 403
+    if not require_super_admin(): 
+        return jsonify({"error": "Accès non autorisé"}), 403
+    
     try:
-        results = db.session.query(
-            Video,
-            User.name.label('player_name'),
-            Club.name.label('club_name')
-        ).join(User, Video.user_id == User.id)\
-         .join(Court, Video.court_id == Court.id)\
-         .join(Club, Court.club_id == Club.id)\
-         .order_by(Video.recorded_at.desc()).all()
+        # Requête simplifiée sans les colonnes problématiques
+        videos = db.session.query(Video).all()
 
         videos_data = []
-        for video, player_name, club_name in results:
-            video_dict = video.to_dict()
-            video_dict['player_name'] = player_name
-            video_dict['club_name'] = club_name
+        for video in videos:
+            video_dict = {
+                "id": video.id,
+                "title": video.title,
+                "description": video.description,
+                "file_url": video.file_url,
+                "thumbnail_url": video.thumbnail_url,
+                "duration": getattr(video, 'duration', None),
+                "file_size": getattr(video, 'file_size', None),
+                "is_unlocked": getattr(video, 'is_unlocked', True),
+                "credits_cost": getattr(video, 'credits_cost', 1),
+                "recorded_at": video.recorded_at.isoformat() if video.recorded_at else None,
+                "created_at": video.created_at.isoformat() if video.created_at else None,
+                "user_id": video.user_id,
+                "court_id": video.court_id
+            }
+            
+            # Ajouter les informations relationnelles
+            if hasattr(video, 'owner') and video.owner:
+                video_dict['player_name'] = video.owner.name
+            else:
+                # Requête manuelle si la relation ne fonctionne pas
+                user = User.query.get(video.user_id)
+                video_dict['player_name'] = user.name if user else "Utilisateur supprimé"
+            
+            if hasattr(video, 'court') and video.court:
+                video_dict['court_name'] = video.court.name
+                if hasattr(video.court, 'club') and video.court.club:
+                    video_dict['club_name'] = video.court.club.name
+                else:
+                    club = Club.query.get(video.court.club_id)
+                    video_dict['club_name'] = club.name if club else "Club inconnu"
+            else:
+                # Requête manuelle si la relation ne fonctionne pas
+                court = Court.query.get(video.court_id)
+                if court:
+                    video_dict['court_name'] = court.name
+                    club = Club.query.get(court.club_id)
+                    video_dict['club_name'] = club.name if club else "Club inconnu"
+                else:
+                    video_dict['court_name'] = "Terrain inconnu"
+                    video_dict['club_name'] = "Club inconnu"
+            
             videos_data.append(video_dict)
         
         return jsonify({"videos": videos_data}), 200
+        
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des vidéos: {e}")
-        return jsonify({"error": "Erreur serveur"}), 500
+        return jsonify({"error": f"Erreur serveur: {str(e)}"}), 500
 
 # ====================================================================
 # CORRECTION MAJEURE ICI
