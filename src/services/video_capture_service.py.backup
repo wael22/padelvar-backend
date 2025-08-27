@@ -1,0 +1,1876 @@
+"""
+Service de capture vidÃ©o - Enregistrement des flux camÃ©ra vers stockage local
+OptimisÃ© pour la performance, la fiabilitÃ© et la gestion des erreurs
+"""
+
+import cv2
+import threading
+import time
+import os
+import logging
+import queue
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Any, Tuple
+import uuid
+import subprocess
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+
+from ..models.database import db
+from ..models.user import Video, Court, User
+from .bunny_storage_service import bunny_storage_service
+from .mjpeg_recording_service import (
+    MJPEGRecordingManager,
+    MJPEGRecordingConfig,
+)
+
+# Configuration du logger
+logger = logging.getLogger(__name__)
+
+# Configuration FFmpeg - Utiliser le chemin complet sur Windows
+FFMPEG_PATH = r"C:\ffmpeg\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe"
+if not Path(FFMPEG_PATH).exists():
+    FFMPEG_PATH = 'ffmpeg'
+    logger.warning("â ï¸ FFmpeg non trouvÃ© au chemin complet, utilisation de 'ffmpeg' dans le PATH")
+else:
+    logger.info(f"â FFmpeg trouvÃ©: {FFMPEG_PATH}")
+# Nouveau: chemin ffprobe (corrige WinError 2)
+FFPROBE_PATH = str(Path(FFMPEG_PATH).with_name('ffprobe.exe')) if os.name == 'nt' else 'ffprobe'
+if os.name == 'nt' and not Path(FFPROBE_PATH).exists():
+    FFPROBE_PATH = 'ffprobe'  # fallback PATH
+
+class RecordingStatus(Enum):
+    """Ãtats possibles d'un enregistrement"""
+    CREATED = 'created'
+    RECORDING = 'recording'
+    STOPPING = 'stopping'
+    COMPLETED = 'completed'
+    ERROR = 'error'
+
+class CameraStream:
+    """Gestion de flux vidÃ©o depuis camÃ©ras IP"""
+    
+    def __init__(self, camera_url: str, buffer_size: int = 10):
+        """
+        Initialise une connexion Ã  un flux camÃ©ra.
+        
+        Args:
+            camera_url: URL de la camÃ©ra (RTSP, HTTP, etc.)
+            buffer_size: Taille du buffer de frames
+        """
+        self.camera_url = camera_url
+        self.is_running = False
+        self.frame_buffer = queue.Queue(maxsize=buffer_size)
+        self.lock = threading.RLock()
+        self.capture = None
+        self.thread = None
+        self.last_frame = None
+        self.last_error = None
+        self.reconnect_delay = 5  # secondes
+        self.max_reconnect_attempts = 5
+        
+    def start(self) -> bool:
+        """
+        DÃ©marre la capture du flux camÃ©ra dans un thread sÃ©parÃ©.
+        
+        Returns:
+            True si dÃ©marrÃ© avec succÃ¨s, False sinon
+        """
+        with self.lock:
+            if self.is_running:
+                return True
+                
+            self.is_running = True
+            self.thread = threading.Thread(
+                target=self._capture_loop,
+                daemon=True
+            )
+            self.thread.start()
+            
+            # Attendre que le premier frame soit disponible ou qu'une erreur survienne
+            timeout = 5  # secondes
+            start_time = time.time()
+            
+            while time.time() - start_time < timeout:
+                if not self.frame_buffer.empty() or self.last_error:
+                    break
+                time.sleep(0.1)
+                
+            return not self.frame_buffer.empty()
+    
+    def stop(self):
+        """ArrÃªte la capture du flux camÃ©ra"""
+        with self.lock:
+            self.is_running = False
+            
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=2)
+                
+            if self.capture:
+                self.capture.release()
+                self.capture = None
+                
+            # Vider le buffer
+            while not self.frame_buffer.empty():
+                try:
+                    self.frame_buffer.get_nowait()
+                except queue.Empty:
+                    break
+    
+    def get_frame(self) -> Tuple[bool, Optional[Any]]:
+        """
+        RÃ©cupÃ¨re le dernier frame du buffer.
+        
+        Returns:
+            (success, frame): Tuple indiquant si un frame est disponible et le frame lui-mÃªme
+        """
+        try:
+            if not self.frame_buffer.empty():
+                frame = self.frame_buffer.get_nowait()
+                self.last_frame = frame
+                return True, frame
+            elif self.last_frame is not None:
+                return True, self.last_frame
+            else:
+                return False, None
+        except Exception as e:
+            logger.error(f"Erreur lors de la rÃ©cupÃ©ration du frame: {e}")
+            return False, None
+    
+    def _capture_loop(self):
+        """Boucle principale de capture des frames"""
+        reconnect_attempts = 0
+        
+        while self.is_running:
+            try:
+                if self.capture is None or not self.capture.isOpened():
+                    # Initialiser ou rÃ©initialiser la capture
+                    if self.capture:
+                        self.capture.release()
+                    self.capture = cv2.VideoCapture(self.camera_url)
+                    if not self.capture.isOpened():
+                        reconnect_attempts += 1
+                        self.last_error = (
+                            f"Impossible d'ouvrir la camÃ©ra: {self.camera_url}"
+                        )
+                        logger.warning(
+                            f"{self.last_error} (tentative {reconnect_attempts}/"
+                            f"{self.max_reconnect_attempts})"
+                        )
+                        
+                        if reconnect_attempts >= self.max_reconnect_attempts:
+                            logger.error(f"Abandon aprÃ¨s {reconnect_attempts} tentatives")
+                            self.is_running = False
+                            break
+                            
+                        time.sleep(self.reconnect_delay)
+                        continue
+                    else:
+                        reconnect_attempts = 0
+                        logger.info(f"Connexion Ã©tablie au flux: {self.camera_url}")
+                
+                # Lire un frame
+                ret, frame = self.capture.read()
+                
+                if not ret:
+                    logger.warning(f"Erreur de lecture du frame depuis {self.camera_url}")
+                    time.sleep(0.5)
+                    continue
+                
+                # Mettre le frame dans le buffer (en Ã©crasant le plus ancien si plein)
+                if self.frame_buffer.full():
+                    try:
+                        self.frame_buffer.get_nowait()
+                    except queue.Empty:
+                        pass
+                        
+                self.frame_buffer.put(frame)
+                
+            except Exception as e:
+                logger.error(f"Erreur dans la boucle de capture: {e}")
+                time.sleep(1)
+        
+        # Nettoyage final
+        if self.capture:
+            self.capture.release()
+            self.capture = None
+
+class RecordingTask:
+    """ReprÃ©sente une tÃ¢che d'enregistrement vidÃ©o"""
+    
+    def __init__(self, session_id: str, camera_url: str, output_path: str, 
+                 max_duration: int, user_id: int, court_id: int,
+                 session_name: str, video_quality: Dict[str, Any]):
+        """
+        Initialise une tÃ¢che d'enregistrement.
+        
+        Args:
+            session_id: Identifiant unique de la session
+            camera_url: URL de la camÃ©ra
+            output_path: Chemin du fichier de sortie
+            max_duration: DurÃ©e maximale en secondes
+            user_id: ID de l'utilisateur
+            court_id: ID du terrain
+            session_name: Nom de la session
+            video_quality: ParamÃ¨tres de qualitÃ© vidÃ©o
+        """
+        self.session_id = session_id
+        self.camera_url = camera_url
+        self.output_path = output_path
+        self.max_duration = max_duration
+        self.user_id = user_id
+        self.court_id = court_id
+        self.session_name = session_name
+        self.video_quality = video_quality
+        
+        self.start_time = datetime.now()
+        self.status = 'created'
+        self.process = None
+        self.camera_stream = None
+        self.error = None
+        self.file_size = 0
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convertit l'objet en dictionnaire.
+        
+        Returns:
+            Dictionnaire des attributs de la tÃ¢che
+        """
+        duration = int((datetime.now() - self.start_time).total_seconds())
+        
+        return {
+            'session_id': self.session_id,
+            'camera_url': self.camera_url,
+            'output_path': self.output_path,
+            'status': self.status,
+            'start_time': self.start_time.isoformat(),
+            'duration': duration,
+            'user_id': self.user_id,
+            'court_id': self.court_id,
+            'session_name': self.session_name,
+            'file_size': self.file_size,
+            'error': self.error
+        }
+
+class VideoCaptureService:
+    """Service optimisÃ© de capture vidÃ©o pour camÃ©ras IP et enregistrements fiables"""
+    
+    def __init__(self, base_path: str = "static/videos"):
+        """
+        Initialise le service de capture vidÃ©o.
+        
+        Args:
+            base_path: Chemin de base pour le stockage des vidÃ©os
+        """
+        # Configuration des chemins
+        self.base_path = Path(base_path)
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        
+        self.thumbnails_path = Path("static/thumbnails")
+        self.thumbnails_path.mkdir(parents=True, exist_ok=True)
+        
+        self.temp_path = Path("static/temp")
+        self.temp_path.mkdir(parents=True, exist_ok=True)
+        
+        # --- Nouveau: configuration modes & limites ---
+        self.recording_mode = os.getenv('RECORDING_MODE', 'single').lower()  # 'single' | 'segmented'
+        self.max_concurrent_recordings = int(os.getenv('MAX_CONCURRENT_RECORDINGS', '10'))
+        if self.recording_mode not in ('single', 'segmented'):
+            logger.warning(f"Mode RECORDING_MODE invalide: {self.recording_mode}, fallback 'single'")
+            self.recording_mode = 'single'
+        logger.info(f"ðï¸ Mode d'enregistrement MJPEG: {self.recording_mode}")
+        logger.info(f"ðï¸ Limite enregistrements concurrents: {self.max_concurrent_recordings}")
+        # ------------------------------------------------
+        
+        # Gestion des enregistrements
+        self.recordings: Dict[str, RecordingTask] = {}
+        self.recording_processes: Dict[str, subprocess.Popen] = {}
+        self.camera_streams: Dict[str, CameraStream] = {}
+        
+        # Gestionnaire MJPEG pour Bunny Stream
+        self.mjpeg_manager = MJPEGRecordingManager(MJPEGRecordingConfig())
+        
+        # Verrou pour la synchronisation des accÃ¨s concurrents
+        self.lock = threading.RLock()
+        
+        # Configuration d'encodage
+        self.max_recording_duration = 3600  # 1 heure max
+        self.video_quality = {
+            'fps': 25,
+            'width': 1280,
+            'height': 720,
+            'bitrate': '2M',
+            'preset': 'veryfast',  # Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+            'tune': 'zerolatency'  # OptimisÃ© pour le streaming temps rÃ©el
+        }
+        
+        # Pool de threads pour les tÃ¢ches asynchrones
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
+        
+        # DÃ©marrer le thread de surveillance
+        self.monitoring_thread = threading.Thread(
+            target=self._monitoring_loop,
+            daemon=True
+        )
+        self.monitoring_thread.start()
+        
+        logger.info("â Service de capture vidÃ©o initialisÃ© avec succÃ¨s")
+    
+    def start_recording(self, court_id: int, user_id: int, session_name: str = None, session_id: str | None = None) -> Dict[str, Any]:
+        """
+        DÃ©marre l'enregistrement d'un terrain.
+        Peut accepter un session_id externe pour aligner les identifiants (RecordingSession).
+        
+        Args:
+            court_id: ID du terrain Ã  enregistrer
+            user_id: ID de l'utilisateur qui dÃ©marre l'enregistrement
+            session_name: Nom de la session (optionnel)
+            session_id: Identifiant de session externe (optionnel)
+            
+        Returns:
+            Informations sur la session d'enregistrement dÃ©marrÃ©e
+        
+        Raises:
+            ValueError: Si les paramÃ¨tres sont invalides
+            RuntimeError: Si l'enregistrement ne peut pas dÃ©marrer
+        """
+        # CORRIGÃ: rÃ©implantation complÃ¨te avec gÃ©nÃ©ration IDs, tÃ¢che et sÃ©lection du mode
+        with self.lock:
+            try:
+                court = self._validate_court(court_id)
+                user = self._validate_user(user_id)
+                for rec in self.recordings.values():
+                    if rec.court_id == court_id:
+                        raise RuntimeError(f"Un enregistrement est dÃ©jÃ  actif sur le terrain {court_id}")
+                if len(self.recordings) >= self.max_concurrent_recordings:
+                    raise RuntimeError("Limite d'enregistrements concurrents atteinte")
+                # Utiliser l'ID fourni sinon en gÃ©nÃ©rer un
+                if session_id is None:
+                    session_id = f"rec_{court_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+                if not session_name:
+                    session_name = f"Match du {datetime.now().strftime('%d/%m/%Y')}"
+                video_filename = f"{session_id}.mp4"
+                video_path = str(self.base_path / video_filename)
+                camera_url = self._get_camera_url(court)
+                recording_task = RecordingTask(
+                    session_id=session_id,
+                    camera_url=camera_url,
+                    output_path=video_path,
+                    max_duration=self.max_recording_duration,
+                    user_id=user_id,
+                    court_id=court_id,
+                    session_name=session_name,
+                    video_quality=self.video_quality
+                )
+                if self._is_mjpeg_url(camera_url):
+                    if self.recording_mode == 'segmented':
+                        success = self._start_mjpeg_recording_segmented(recording_task)
+                    else:
+                        success = self._start_mjpeg_recording_single(recording_task)
+                elif self._is_rtsp_url(camera_url):
+                    success = self._start_ffmpeg_recording(recording_task)
+                else:
+                    success = self._start_opencv_recording(recording_task)
+                if not success:
+                    raise RuntimeError(f"Impossible de dÃ©marrer l'enregistrement pour le terrain {court_id}")
+                self.recordings[session_id] = recording_task
+                logger.info(f"ð¬ Enregistrement dÃ©marrÃ©: {session_id} pour terrain {court_id}")
+                return {
+                    'session_id': session_id,
+                    'status': 'started',
+                    'message': f"Enregistrement dÃ©marrÃ© pour {session_name}",
+                    'video_filename': video_filename,
+                    'camera_url': camera_url,
+                    'recording_type': getattr(recording_task, 'recording_type', 'standard')
+                }
+            except Exception as e:
+                logger.error(f"â Erreur lors du dÃ©marrage de l'enregistrement: {e}")
+                if 'session_id' in locals():
+                    self._cleanup_recording(session_id)
+                raise
+    
+    def stop_recording(self, session_id: str) -> Dict[str, Any]:
+        """
+        ArrÃªte l'enregistrement d'une session.
+        
+        Args:
+            session_id: Identifiant de la session Ã  arrÃªter
+            
+        Returns:
+            Informations sur la session arrÃªtÃ©e
+            
+        Raises:
+            ValueError: Si la session n'existe pas
+        """
+        with self.lock:
+            if session_id not in self.recordings:
+                return {
+                    'status': 'error',
+                    'error': f"Session {session_id} non trouvÃ©e",
+                    'message': "Enregistrement introuvable ou dÃ©jÃ  terminÃ©"
+                }
+            
+            recording = self.recordings[session_id]
+            recording.status = 'stopping'
+            if hasattr(recording, 'recording_type') and recording.recording_type == 'mjpeg_single':
+                logger.debug(f"ArrÃªt MJPEG single: {session_id}")
+            # Process handling
+            if session_id in self.recording_processes:
+                process = self.recording_processes[session_id]
+                try:
+                    self._graceful_stop_ffmpeg(process, session_id)
+                finally:
+                    if process.poll() is None:
+                        try:
+                            process.terminate(); process.wait(timeout=3)
+                        except Exception:
+                            try: process.kill()
+                            except Exception: pass
+                    exit_code = process.returncode
+                    del self.recording_processes[session_id]
+                    logger.info(f"FFmpeg terminÃ© pour {session_id} code={exit_code}")
+            # Stop camera stream
+            if session_id in self.camera_streams:
+                self.camera_streams[session_id].stop(); del self.camera_streams[session_id]
+        # Finalize outside lock
+        result = self._finalize_recording(session_id)
+        with self.lock:
+            if session_id in self.recordings:
+                del self.recordings[session_id]
+        logger.info(f"â¹ï¸ Enregistrement arrÃªtÃ©: {session_id} -> {result.get('status')} taille={self._get_file_size(recording.output_path)}")
+        return result
+
+    def _get_file_size(self, file_path: str) -> int:
+        try:
+            return os.path.getsize(file_path)
+        except Exception:
+            return 0
+
+    def _generate_thumbnail(self, video_path: str, session_id: str) -> bool:
+        """GÃ©nÃ¨re une miniature Ã  ~1s (fallback OpenCV si ffmpeg Ã©choue)."""
+        try:
+            thumb_path = self.thumbnails_path / f"{session_id}.jpg"
+            # Essayer avec ffmpeg
+            cmd = [
+                FFMPEG_PATH,
+                '-y',
+                '-ss', '1',  # position approximative
+                '-i', video_path,
+                '-vframes', '1',
+                '-vf', 'scale=320:-1',
+                str(thumb_path)
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+            if proc.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 1000:
+                return True
+            logger.warning(f"Fallback OpenCV thumbnail (ffmpeg code={proc.returncode})")
+        except Exception as fe:
+            logger.warning(f"Thumbnail ffmpeg Ã©chec: {fe}")
+        # Fallback OpenCV
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return False
+            cap.set(cv2.CAP_PROP_POS_MSEC, 1000)  # 1s
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                return False
+            cv2.imwrite(str(self.thumbnails_path / f"{session_id}.jpg"), frame)
+            return True
+        except Exception as oe:
+            logger.error(f"Thumbnail OpenCV Ã©chec: {oe}")
+            return False
+
+    def _stretch_video_duration(self, src_path: str, ratio: float) -> tuple[bool, float, str]:
+        """Ãtire la durÃ©e vidÃ©o (ralentit) via setpts si ratio>1.
+        Retourne (success, new_duration, new_path)."""
+        try:
+            if ratio <= 1.05:
+                return False, 0.0, src_path
+            # Limiter ratio pour Ã©viter valeurs extrÃªmes
+            ratio = min(ratio, 30.0)
+            tmp_path = str(Path(src_path).with_suffix('.stretch.tmp.mp4'))
+            cmd = [
+                FFMPEG_PATH,
+                '-hide_banner','-loglevel','error',
+                '-i', src_path,
+                '-an',  # pas d'audio
+                '-filter:v', f'setpts={ratio}*PTS',
+                '-movflags', '+faststart',
+                '-preset', 'veryfast',
+                '-crf', '23',
+                tmp_path
+            ]
+            logger.info(f"ð ï¸ Ãtirement vidÃ©o ratio={ratio:.2f} cmd={' '.join(cmd)}")
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+            if proc.returncode != 0 or not os.path.exists(tmp_path):
+                logger.error(f"Ãchec Ã©tirement vidÃ©o: code={proc.returncode} err={proc.stderr[:200]}")
+                return False, 0.0, src_path
+            # Probe nouvelle durÃ©e
+            new_dur = None
+            try:
+                probe = subprocess.run([FFPROBE_PATH,'-v','error','-select_streams','v:0','-show_entries','stream=duration','-of','default=noprint_wrappers=1',tmp_path],stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True,timeout=10)
+                if probe.returncode==0:
+                    for line in probe.stdout.splitlines():
+                        if line.startswith('duration='):
+                            try: new_dur=float(line.split('=')[1])
+                            except: pass
+            except Exception:
+                pass
+            if new_dur is None:
+                new_dur = 0.0
+            # Remplacer fichier source (backup facultative)
+            backup_path = src_path + '.orig'
+            try:
+                os.replace(src_path, backup_path)
+                os.replace(tmp_path, src_path)
+            except Exception as rep_e:
+                logger.error(f"Remplacement fichier Ã©chouÃ©: {rep_e}")
+                return False, 0.0, src_path
+            # Garder backup pour debug (peut Ãªtre nettoyÃ© plus tard)
+            logger.info(f"â Ãtirement terminÃ© nouvelle_durÃ©eâ{new_dur:.1f}s (ratio demandÃ© {ratio:.2f})")
+            return True, new_dur, backup_path
+        except Exception as e:
+            logger.error(f"Erreur stretch vidÃ©o: {e}")
+            return False, 0.0, src_path
+
+    def _finalize_recording(self, session_id: str) -> Dict[str, Any]:
+        """Finalise l'enregistrement et crÃ©e l'entrÃ©e en base (tolÃ©rant si ffprobe absent)."""
+        try:
+            recording = self.recordings[session_id]
+            if not os.path.exists(recording.output_path):
+                return {'status':'error','error':f"Fichier vidÃ©o non trouvÃ©: {recording.output_path}", 'message':'Finalisation impossible'}
+            duration_seconds = None
+            nb_frames = None
+            probe_ok = False
+            try:
+                probe_cmd = [
+                    FFPROBE_PATH,
+                    '-v','error',
+                    '-select_streams','v:0',
+                    '-show_entries','stream=duration,nb_frames',
+                    '-of','default=noprint_wrappers=1',
+                    recording.output_path
+                ]
+                probe = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=12)
+                probe_ok = probe.returncode == 0
+                if probe_ok:
+                    for line in probe.stdout.splitlines():
+                        if line.startswith('duration='):
+                            try: duration_seconds = float(line.split('=')[1])
+                            except: pass
+                        elif line.startswith('nb_frames='):
+                            try: nb_frames = int(line.split('=')[1])
+                            except: pass
+                else:
+                    if 'moov atom not found' in probe.stderr.lower():
+                        logger.error(f"â moov absent {session_id}")
+            except FileNotFoundError:
+                logger.warning("ffprobe introuvable - fallback estimation durÃ©e")
+            except Exception as pe:
+                logger.warning(f"Probe Ã©chec: {pe}")
+            file_size = self._get_file_size(recording.output_path)
+            wallclock_secs = (datetime.now()-recording.start_time).total_seconds()
+            if duration_seconds is None:
+                duration_seconds = max(1, int(wallclock_secs))
+            target_fps = self.video_quality.get('fps',25)
+            est_from_frames = (nb_frames/target_fps) if (nb_frames and target_fps) else None
+            if est_from_frames and abs(est_from_frames - wallclock_secs) > 5:
+                logger.warning(
+                    f"â±ï¸ Ecart durÃ©e: wallclock={wallclock_secs:.1f}s ffprobe={duration_seconds:.1f}s frames_est={est_from_frames:.1f}s nb_frames={nb_frames}")
+            # Ãtirement si ratio important (>1.5) et frames_est proche durÃ©e actuelle (indiquant timestamps compressÃ©s)
+            stretched = False
+            backup_path = None
+            if wallclock_secs > 6 and duration_seconds > 0 and wallclock_secs/duration_seconds > 1.5:
+                ratio = wallclock_secs / duration_seconds
+                ok, new_dur, backup_path = self._stretch_video_duration(recording.output_path, ratio)
+                if ok and new_dur > duration_seconds:
+                    duration_seconds = new_dur
+                    stretched = True
+            # Reprobe aprÃ¨s Ã©ventuel stretch (durÃ©e plus prÃ©cise)
+            if stretched:
+                try:
+                    probe2 = subprocess.run([
+                        FFPROBE_PATH,'-v','error','-select_streams','v:0','-show_entries','stream=duration','-of','default=noprint_wrappers=1',recording.output_path
+                    ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True,timeout=8)
+                    if probe2.returncode==0:
+                        for line in probe2.stdout.splitlines():
+                            if line.startswith('duration='):
+                                try: duration_seconds=float(line.split('=')[1])
+                                except: pass
+                except Exception:
+                    pass
+            # Rejet si fichier trÃ¨s court avant crÃ©ation DB
+            if duration_seconds < 3 or file_size < 200*1024:
+                return {'status':'error','error':'Fichier incomplet','file_size':file_size,'duration':duration_seconds,'nb_frames':nb_frames}
+            thumb = self._generate_thumbnail(recording.output_path, recording.session_id)
+            video = Video(
+                title=recording.session_name,
+                file_url=f"/videos/{os.path.basename(recording.output_path)}",
+                thumbnail_url=f"/thumbnails/{recording.session_id}.jpg" if thumb else None,
+                duration=int(duration_seconds),
+                file_size=file_size,
+                court_id=recording.court_id,
+                user_id=recording.user_id,
+                recorded_at=recording.start_time,
+                is_unlocked=False,
+                credits_cost=10,
+            )
+            db.session.add(video); db.session.commit()
+            logger.info(
+                f"â VidÃ©o validÃ©e {video.id} dur={duration_seconds:.1f}s wallclock={wallclock_secs:.1f}s nb_frames={nb_frames} taille={file_size} stretched={stretched}")
+            return {
+                'status':'completed',
+                'video_id':video.id,
+                'video_filename':os.path.basename(recording.output_path),
+                'duration':int(duration_seconds),
+                'wallclock_duration':int(wallclock_secs),
+                'nb_frames':nb_frames,
+                'file_size':file_size,
+                'thumbnail_url':video.thumbnail_url,
+                'stretched': stretched,
+                'original_backup': backup_path if stretched else None
+            }
+        except Exception as e:
+            logger.error(f"â Finalisation erreur: {e}")
+            return {'status':'error','error':str(e)}
+    
+    def test_camera_connection(self, camera_url: str) -> Dict[str, Any]:
+        """
+        Teste la connexion Ã  une camÃ©ra.
+        
+        Args:
+            camera_url: URL de la camÃ©ra Ã  tester
+            
+        Returns:
+            RÃ©sultat du test
+        """
+        try:
+            logger.info(f"ð Test de connexion Ã  la camÃ©ra: {camera_url}")
+            
+            # CrÃ©er un stream de camÃ©ra temporaire
+            camera = CameraStream(camera_url)
+            
+            # Essayer de dÃ©marrer et rÃ©cupÃ©rer un frame
+            start_success = camera.start()
+            frame_success = False
+            resolution = None
+            
+            if start_success:
+                # Attendre un peu pour avoir des frames
+                time.sleep(1)
+                
+                # Essayer de rÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                frame_success = success
+                
+                if success and frame is not None:
+                    height, width = frame.shape[:2]
+                    resolution = {"width": width, "height": height}
+            
+            # ArrÃªter proprement
+            camera.stop()
+            
+            return {
+                'status': 'success' if start_success and frame_success else 'error',
+                'connection': start_success,
+                'frames_available': frame_success,
+                'resolution': resolution,
+                'error': camera.last_error,
+                'url': camera_url
+            }
+            
+        except Exception as e:
+            logger.error(f"â Erreur lors du test de la camÃ©ra: {e}")
+            return {
+                'status': 'error',
+                'connection': False,
+                'frames_available': False,
+                'error': str(e),
+                'url': camera_url
+            }
+    
+    # ------ MÃ©thodes privÃ©es ------
+    
+    def _validate_court(self, court_id: int) -> Court:
+        """Valide et rÃ©cupÃ¨re un terrain"""
+        court = Court.query.get(court_id)
+        if not court:
+            raise ValueError(f"Terrain {court_id} non trouvÃ©")
+        return court
+    
+    def _validate_user(self, user_id: int) -> User:
+        """Valide et rÃ©cupÃ¨re un utilisateur"""
+        user = User.query.get(user_id)
+        if not user:
+            raise ValueError(f"Utilisateur {user_id} non trouvÃ©")
+        return user
+    
+    def _get_camera_url(self, court: Court) -> str:
+        """RÃ©cupÃ¨re l'URL de la camÃ©ra pour un terrain"""
+        if hasattr(court, 'camera_url') and court.camera_url:
+            return court.camera_url
+        else:
+            # URL de simulation pour les tests
+            return f"http://localhost:5000/api/courts/{court.id}/camera_stream"
+    
+    def _is_rtsp_url(self, url: str) -> bool:
+        """DÃ©termine si l'URL est un flux RTSP"""
+        return url.lower().startswith(('rtsp://', 'rtsps://'))
+    
+    def _is_mjpeg_url(self, url: str) -> bool:
+        """DÃ©termine si l'URL est un flux MJPEG"""
+        url_lower = url.lower()
+        return (url_lower.endswith(('.mjpg', '.mjpeg', '.cgi')) or 
+                'mjpg' in url_lower or 'mjpeg' in url_lower)
+    
+    def _start_mjpeg_recording_segmented(self, recording: RecordingTask) -> bool:
+        """Ancien mode segmentÃ©: utilise MJPEGRecordingManager (upload par segments)."""
+        try:
+            result = self.mjpeg_manager.start_recording(
+                recording_id=recording.session_id,
+                mjpeg_url=recording.camera_url,
+                session_name=recording.session_name,
+                segment_duration=300  # configurable via futur env si besoin
+            )
+            recording.recording_type = 'mjpeg_bunny'
+            recording.bunny_session_id = result['session_id']
+            recording.status = 'recording'
+            recording.start_time = datetime.now()
+            logger.info(f"ð¬ (Segmented) Enregistrement MJPEG dÃ©marrÃ© vers Bunny: {recording.session_id}")
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur dÃ©marrage MJPEG segmentÃ©: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+
+    def _spawn_ffmpeg_process(self, cmd: list, session_id: str):
+        """Lance FFmpeg avec stdin PIPE pour pouvoir envoyer 'q' et lit stderr en arriÃ¨re-plan.
+        EmpÃªche le blocage des pipes (memory leak) et permet un arrÃªt propre Ã©crivant l'atome moov."""
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        # Thread lecteur stderr (Ã©vite remplissage buffer)
+        def _drain():
+            try:
+                for line in process.stderr:
+                    if not line:
+                        break
+                    if 'frame=' in line or 'fps=' in line:
+                        continue  # trop verbeux
+                    logger.debug(f"FFmpeg[{session_id}]: {line.strip()}")
+            except Exception:
+                pass
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        return process
+
+    def _graceful_stop_ffmpeg(self, process: subprocess.Popen, session_id: str):
+        """Tente un arrÃªt doux (envoie 'q') pour que FFmpeg Ã©crive la fin du conteneur MP4."""
+        if process.poll() is not None:
+            return
+        try:
+            if process.stdin:
+                try:
+                    process.stdin.write('q')
+                    process.stdin.flush()
+                except Exception:
+                    pass
+            # Attendre Ã©criture trailer
+            process.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            try:
+                process.terminate()  # Windows: TerminateProcess
+                process.wait(timeout=4)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+    def _start_mjpeg_recording_single(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement MJPEG (mode single) avec cadence temps rÃ©el corrigÃ©e.
+        Ajustements:
+          - DÃ©placer le framerate en option D'ENTRÃE (-framerate) avant -i pour que FFmpeg gÃ©nÃ¨re des timestamps espacÃ©s
+          - Retirer combo '-vsync cfr -r <fps>' en sortie qui compressait le temps lorsque les frames arrivaient en rafale
+          - Conserver -re pour limiter la lecture si applicable
+        """
+        try:
+            target_fps = str(self.video_quality.get('fps', 25))
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                '-hide_banner', '-loglevel', 'info',
+                '-re',
+                '-f', 'mjpeg',
+                '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+                '-thread_queue_size', '1024',
+                '-framerate', target_fps,  # (<- IMPORTANT: option d'entrÃ©e)
+                '-i', recording.camera_url,
+                '-fflags', '+genpts',
+                '-use_wallclock_as_timestamps', '1',
+                # Sortie sans forcer vsync/r de nouveau; laisser ffmpeg utiliser le framerate d'entrÃ©e
+                '-c:v', 'libx264',
+                '-preset', self.video_quality['preset'],
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'main',
+                '-movflags', '+faststart',
+                '-crf', '23',
+                '-g', str(int(target_fps) * 2),
+                '-an',
+                recording.output_path
+            ]
+            logger.info(f"ð¬ (Single) FFmpeg MJPEG cmd: {' '.join(ffmpeg_cmd)}")
+            process = self._spawn_ffmpeg_process(ffmpeg_cmd, recording.session_id)
+            if process.poll() is not None:
+                raise RuntimeError('FFmpeg non dÃ©marrÃ©')
+            self.recording_processes[recording.session_id] = process
+            recording.status = 'recording'
+            recording.process = process
+            recording.recording_type = 'mjpeg_single'
+            recording.start_time = datetime.now()
+            threading.Timer(self.max_recording_duration, lambda: self._auto_timeout_stop(recording.session_id)).start()
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur dÃ©marrage MJPEG single: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    def _start_ffmpeg_recording(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement avec FFmpeg (RTSP)."""
+        try:
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                '-rtsp_transport', 'tcp',
+                '-i', recording.camera_url,
+                '-c:v', 'libx264',
+                '-preset', self.video_quality['preset'],
+                '-tune', self.video_quality['tune'],
+                '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                recording.output_path
+            ]
+            logger.info(f"ð¬ DÃ©marrage FFmpeg RTSP: {recording.session_id}")
+            process = self._spawn_ffmpeg_process(ffmpeg_cmd, recording.session_id)
+            if process.poll() is not None:
+                raise RuntimeError("FFmpeg n'a pas pu dÃ©marrer")
+            self.recording_processes[recording.session_id] = process        
+            recording.status = 'recording'
+            recording.process = process
+            recording.recording_type = 'rtsp'
+            recording.start_time = datetime.now()
+            threading.Timer(
+                self.max_recording_duration,
+                lambda: self._auto_timeout_stop(recording.session_id)
+            ).start()
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur lors du dÃ©marrage de FFmpeg: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    
+    def _start_opencv_recording(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement avec OpenCV"""
+        try:
+            # CrÃ©er un stream camÃ©ra
+            camera = CameraStream(recording.camera_url)
+            
+            # Essayer de dÃ©marrer et rÃ©cupÃ©rer un frame
+            start_success = camera.start()
+            frame_success = False
+            resolution = None
+            
+            if start_success:
+                # Attendre un peu pour avoir des frames
+                time.sleep(1)
+                
+                # Essayer de rÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                frame_success = success
+                
+                if success and frame is not None:
+                    height, width = frame.shape[:2]
+                    resolution = {"width": width, "height": height}
+            
+            if not start_success:
+                raise RuntimeError(f"Impossible de dÃ©marrer la capture pour {recording.camera_url}")
+            
+            # Enregistrer le stream
+            recording.camera_stream = camera
+            recording.status = 'recording'
+            recording.recording_type = 'opencv'
+            recording.start_time = datetime.now()
+            
+            # Lancer le thread d'enregistrement OpenCV
+            record_thread = threading.Thread(
+                target=self._opencv_recording_thread,
+                args=(recording.session_id, recording),
+                daemon=True
+            )
+            record_thread.start()
+            
+            # Timer auto-stop sÃ©curitÃ©
+            threading.Timer(
+                self.max_recording_duration,
+                lambda: self._auto_timeout_stop(recording.session_id)
+            ).start()
+            
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur lors du dÃ©marrage d'OpenCV: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    
+    def _opencv_recording_thread(self, session_id: str, recording: RecordingTask):
+        """Thread d'enregistrement vidÃ©o avec OpenCV"""
+        try:
+            camera = self.camera_streams.get(session_id)    
+            if not camera:
+                raise RuntimeError(f"Stream camÃ©ra non trouvÃ© pour {session_id}")
+            
+            # RÃ©cupÃ©rer un premier frame pour obtenir les dimensions    
+            success, frame = camera.get_frame()
+            if not success or frame is None:
+                raise RuntimeError("Impossible d'obtenir le premier frame")
+            
+            height, width = frame.shape[:2]
+            fps = self.video_quality['fps']
+            
+            # Configuration de l'encodeur
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(recording.output_path, fourcc, fps, (width, height))
+            
+            start_time = time.time()
+            frame_count = 0
+            last_frame_time = start_time
+            
+            while True:
+                # VÃ©rifier si on doit s'arrÃªter
+                with self.lock:
+                    if session_id not in self.recordings or self.recordings[session_id].status == 'stopping':
+                        break
+                
+                # RÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                if not success or frame is None:
+                    time.sleep(0.01)  # Pause courte pour Ã©viter CPU 100%
+                    continue
+                
+                # Ãcrire le frame
+                out.write(frame)
+                frame_count += 1
+                
+                # Respecter le FPS cible
+                current_time = time.time()
+                target_time = last_frame_time + (1.0 / fps)
+                if current_time < target_time:
+                    time.sleep(target_time - current_time)
+                
+                last_frame_time = time.time()
+            
+            # Nettoyer les ressources
+            out.release()
+            logger.info(f"â Enregistrement OpenCV terminÃ©: {session_id}, {frame_count} frames")
+            
+        except Exception as e:
+            logger.error(f"â Erreur dans le thread OpenCV pour {session_id}: {e}")
+            with self.lock:
+                if session_id in self.recordings:
+                    self.recordings[session_id].status = 'error'
+                    self.recordings[session_id].error = str(e)
+    
+    def _auto_timeout_stop(self, session_id: str):
+        with self.lock:
+            if session_id in self.recordings and \
+               self.recordings[session_id].status == 'recording':
+                logger.warning(f"â±ï¸ Auto-stop (durÃ©e max atteinte) session {session_id}")
+                try:
+                    self.stop_recording(session_id)
+                except Exception as e:
+                    logger.error(f"Erreur auto-stop: {e}")
+
+    def _finalize_recording(self, session_id: str) -> Dict[str, Any]:
+        """Finalise l'enregistrement et crÃ©e l'entrÃ©e en base (tolÃ©rant si ffprobe absent)."""
+        try:
+            recording = self.recordings[session_id]
+            if not os.path.exists(recording.output_path):
+                return {'status':'error','error':f"Fichier vidÃ©o non trouvÃ©: {recording.output_path}", 'message':'Finalisation impossible'}
+            duration_seconds = None
+            nb_frames = None
+            probe_ok = False
+            try:
+                probe_cmd = [
+                    FFPROBE_PATH,
+                    '-v','error',
+                    '-select_streams','v:0',
+                    '-show_entries','stream=duration,nb_frames',
+                    '-of','default=noprint_wrappers=1',
+                    recording.output_path
+                ]
+                probe = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=12)
+                probe_ok = probe.returncode == 0
+                if probe_ok:
+                    for line in probe.stdout.splitlines():
+                        if line.startswith('duration='):
+                            try: duration_seconds = float(line.split('=')[1])
+                            except: pass
+                        elif line.startswith('nb_frames='):
+                            try: nb_frames = int(line.split('=')[1])
+                            except: pass
+                else:
+                    if 'moov atom not found' in probe.stderr.lower():
+                        logger.error(f"â moov absent {session_id}")
+            except FileNotFoundError:
+                logger.warning("ffprobe introuvable - fallback estimation durÃ©e")
+            except Exception as pe:
+                logger.warning(f"Probe Ã©chec: {pe}")
+            file_size = self._get_file_size(recording.output_path)
+            wallclock_secs = (datetime.now()-recording.start_time).total_seconds()
+            if duration_seconds is None:
+                duration_seconds = max(1, int(wallclock_secs))
+            target_fps = self.video_quality.get('fps',25)
+            est_from_frames = (nb_frames/target_fps) if (nb_frames and target_fps) else None
+            if est_from_frames and abs(est_from_frames - wallclock_secs) > 5:
+                logger.warning(
+                    f"â±ï¸ Ecart durÃ©e: wallclock={wallclock_secs:.1f}s ffprobe={duration_seconds:.1f}s frames_est={est_from_frames:.1f}s nb_frames={nb_frames}")
+            # Ãtirement si ratio important (>1.5) et frames_est proche durÃ©e actuelle (indiquant timestamps compressÃ©s)
+            stretched = False
+            backup_path = None
+            if wallclock_secs > 6 and duration_seconds > 0 and wallclock_secs/duration_seconds > 1.5:
+                ratio = wallclock_secs / duration_seconds
+                ok, new_dur, backup_path = self._stretch_video_duration(recording.output_path, ratio)
+                if ok and new_dur > duration_seconds:
+                    duration_seconds = new_dur
+                    stretched = True
+            # Reprobe aprÃ¨s Ã©ventuel stretch (durÃ©e plus prÃ©cise)
+            if stretched:
+                try:
+                    probe2 = subprocess.run([
+                        FFPROBE_PATH,'-v','error','-select_streams','v:0','-show_entries','stream=duration','-of','default=noprint_wrappers=1',recording.output_path
+                    ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True,timeout=8)
+                    if probe2.returncode==0:
+                        for line in probe2.stdout.splitlines():
+                            if line.startswith('duration='):
+                                try: duration_seconds=float(line.split('=')[1])
+                                except: pass
+                except Exception:
+                    pass
+            # Rejet si fichier trÃ¨s court avant crÃ©ation DB
+            if duration_seconds < 3 or file_size < 200*1024:
+                return {'status':'error','error':'Fichier incomplet','file_size':file_size,'duration':duration_seconds,'nb_frames':nb_frames}
+            thumb = self._generate_thumbnail(recording.output_path, recording.session_id)
+            video = Video(
+                title=recording.session_name,
+                file_url=f"/videos/{os.path.basename(recording.output_path)}",
+                thumbnail_url=f"/thumbnails/{recording.session_id}.jpg" if thumb else None,
+                duration=int(duration_seconds),
+                file_size=file_size,
+                court_id=recording.court_id,
+                user_id=recording.user_id,
+                recorded_at=recording.start_time,
+                is_unlocked=False,
+                credits_cost=10,
+            )
+            db.session.add(video); db.session.commit()
+            logger.info(
+                f"â VidÃ©o validÃ©e {video.id} dur={duration_seconds:.1f}s wallclock={wallclock_secs:.1f}s nb_frames={nb_frames} taille={file_size} stretched={stretched}")
+            return {
+                'status':'completed',
+                'video_id':video.id,
+                'video_filename':os.path.basename(recording.output_path),
+                'duration':int(duration_seconds),
+                'wallclock_duration':int(wallclock_secs),
+                'nb_frames':nb_frames,
+                'file_size':file_size,
+                'thumbnail_url':video.thumbnail_url,
+                'stretched': stretched,
+                'original_backup': backup_path if stretched else None
+            }
+        except Exception as e:
+            logger.error(f"â Finalisation erreur: {e}")
+            return {'status':'error','error':str(e)}
+    
+    def test_camera_connection(self, camera_url: str) -> Dict[str, Any]:
+        """
+        Teste la connexion Ã  une camÃ©ra.
+        
+        Args:
+            camera_url: URL de la camÃ©ra Ã  tester
+            
+        Returns:
+            RÃ©sultat du test
+        """
+        try:
+            logger.info(f"ð Test de connexion Ã  la camÃ©ra: {camera_url}")
+            
+            # CrÃ©er un stream de camÃ©ra temporaire
+            camera = CameraStream(camera_url)
+            
+            # Essayer de dÃ©marrer et rÃ©cupÃ©rer un frame
+            start_success = camera.start()
+            frame_success = False
+            resolution = None
+            
+            if start_success:
+                # Attendre un peu pour avoir des frames
+                time.sleep(1)
+                
+                # Essayer de rÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                frame_success = success
+                
+                if success and frame is not None:
+                    height, width = frame.shape[:2]
+                    resolution = {"width": width, "height": height}
+            
+            # ArrÃªter proprement
+            camera.stop()
+            
+            return {
+                'status': 'success' if start_success and frame_success else 'error',
+                'connection': start_success,
+                'frames_available': frame_success,
+                'resolution': resolution,
+                'error': camera.last_error,
+                'url': camera_url
+            }
+            
+        except Exception as e:
+            logger.error(f"â Erreur lors du test de la camÃ©ra: {e}")
+            return {
+                'status': 'error',
+                'connection': False,
+                'frames_available': False,
+                'error': str(e),
+                'url': camera_url
+            }
+    
+    # ------ MÃ©thodes privÃ©es ------
+    
+    def _validate_court(self, court_id: int) -> Court:
+        """Valide et rÃ©cupÃ¨re un terrain"""
+        court = Court.query.get(court_id)
+        if not court:
+            raise ValueError(f"Terrain {court_id} non trouvÃ©")
+        return court
+    
+    def _validate_user(self, user_id: int) -> User:
+        """Valide et rÃ©cupÃ¨re un utilisateur"""
+        user = User.query.get(user_id)
+        if not user:
+            raise ValueError(f"Utilisateur {user_id} non trouvÃ©")
+        return user
+    
+    def _get_camera_url(self, court: Court) -> str:
+        """RÃ©cupÃ¨re l'URL de la camÃ©ra pour un terrain"""
+        if hasattr(court, 'camera_url') and court.camera_url:
+            return court.camera_url
+        else:
+            # URL de simulation pour les tests
+            return f"http://localhost:5000/api/courts/{court.id}/camera_stream"
+    
+    def _is_rtsp_url(self, url: str) -> bool:
+        """DÃ©termine si l'URL est un flux RTSP"""
+        return url.lower().startswith(('rtsp://', 'rtsps://'))
+    
+    def _is_mjpeg_url(self, url: str) -> bool:
+        """DÃ©termine si l'URL est un flux MJPEG"""
+        url_lower = url.lower()
+        return (url_lower.endswith(('.mjpg', '.mjpeg', '.cgi')) or 
+                'mjpg' in url_lower or 'mjpeg' in url_lower)
+    
+    def _start_mjpeg_recording_segmented(self, recording: RecordingTask) -> bool:
+        """Ancien mode segmentÃ©: utilise MJPEGRecordingManager (upload par segments)."""
+        try:
+            result = self.mjpeg_manager.start_recording(
+                recording_id=recording.session_id,
+                mjpeg_url=recording.camera_url,
+                session_name=recording.session_name,
+                segment_duration=300  # configurable via futur env si besoin
+            )
+            recording.recording_type = 'mjpeg_bunny'
+            recording.bunny_session_id = result['session_id']
+            recording.status = 'recording'
+            recording.start_time = datetime.now()
+            logger.info(f"ð¬ (Segmented) Enregistrement MJPEG dÃ©marrÃ© vers Bunny: {recording.session_id}")
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur dÃ©marrage MJPEG segmentÃ©: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+
+    def _spawn_ffmpeg_process(self, cmd: list, session_id: str):
+        """Lance FFmpeg avec stdin PIPE pour pouvoir envoyer 'q' et lit stderr en arriÃ¨re-plan.
+        EmpÃªche le blocage des pipes (memory leak) et permet un arrÃªt propre Ã©crivant l'atome moov."""
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        # Thread lecteur stderr (Ã©vite remplissage buffer)
+        def _drain():
+            try:
+                for line in process.stderr:
+                    if not line:
+                        break
+                    if 'frame=' in line or 'fps=' in line:
+                        continue  # trop verbeux
+                    logger.debug(f"FFmpeg[{session_id}]: {line.strip()}")
+            except Exception:
+                pass
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        return process
+
+    def _graceful_stop_ffmpeg(self, process: subprocess.Popen, session_id: str):
+        """Tente un arrÃªt doux (envoie 'q') pour que FFmpeg Ã©crive la fin du conteneur MP4."""
+        if process.poll() is not None:
+            return
+        try:
+            if process.stdin:
+                try:
+                    process.stdin.write('q')
+                    process.stdin.flush()
+                except Exception:
+                    pass
+            # Attendre Ã©criture trailer
+            process.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            try:
+                process.terminate()  # Windows: TerminateProcess
+                process.wait(timeout=4)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+    def _start_mjpeg_recording_single(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement MJPEG (mode single) avec cadence temps rÃ©el corrigÃ©e.
+        Ajustements:
+          - DÃ©placer le framerate en option D'ENTRÃE (-framerate) avant -i pour que FFmpeg gÃ©nÃ¨re des timestamps espacÃ©s
+          - Retirer combo '-vsync cfr -r <fps>' en sortie qui compressait le temps lorsque les frames arrivaient en rafale
+          - Conserver -re pour limiter la lecture si applicable
+        """
+        try:
+            target_fps = str(self.video_quality.get('fps', 25))
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                '-hide_banner', '-loglevel', 'info',
+                '-re',
+                '-f', 'mjpeg',
+                '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+                '-thread_queue_size', '1024',
+                '-framerate', target_fps,  # (<- IMPORTANT: option d'entrÃ©e)
+                '-i', recording.camera_url,
+                '-fflags', '+genpts',
+                '-use_wallclock_as_timestamps', '1',
+                # Sortie sans forcer vsync/r de nouveau; laisser ffmpeg utiliser le framerate d'entrÃ©e
+                '-c:v', 'libx264',
+                '-preset', self.video_quality['preset'],
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'main',
+                '-movflags', '+faststart',
+                '-crf', '23',
+                '-g', str(int(target_fps) * 2),
+                '-an',
+                recording.output_path
+            ]
+            logger.info(f"ð¬ (Single) FFmpeg MJPEG cmd: {' '.join(ffmpeg_cmd)}")
+            process = self._spawn_ffmpeg_process(ffmpeg_cmd, recording.session_id)
+            if process.poll() is not None:
+                raise RuntimeError('FFmpeg non dÃ©marrÃ©')
+            self.recording_processes[recording.session_id] = process
+            recording.status = 'recording'
+            recording.process = process
+            recording.recording_type = 'mjpeg_single'
+            recording.start_time = datetime.now()
+            threading.Timer(self.max_recording_duration, lambda: self._auto_timeout_stop(recording.session_id)).start()
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur dÃ©marrage MJPEG single: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    def _start_ffmpeg_recording(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement avec FFmpeg (RTSP)."""
+        try:
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                '-rtsp_transport', 'tcp',
+                '-i', recording.camera_url,
+                '-c:v', 'libx264',
+                '-preset', self.video_quality['preset'],
+                '-tune', self.video_quality['tune'],
+                '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                recording.output_path
+            ]
+            logger.info(f"ð¬ DÃ©marrage FFmpeg RTSP: {recording.session_id}")
+            process = self._spawn_ffmpeg_process(ffmpeg_cmd, recording.session_id)
+            if process.poll() is not None:
+                raise RuntimeError("FFmpeg n'a pas pu dÃ©marrer")
+            self.recording_processes[recording.session_id] = process        
+            recording.status = 'recording'
+            recording.process = process
+            recording.recording_type = 'rtsp'
+            recording.start_time = datetime.now()
+            threading.Timer(
+                self.max_recording_duration,
+                lambda: self._auto_timeout_stop(recording.session_id)
+            ).start()
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur lors du dÃ©marrage de FFmpeg: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    
+    def _start_opencv_recording(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement avec OpenCV"""
+        try:
+            # CrÃ©er un stream camÃ©ra
+            camera = CameraStream(recording.camera_url)
+            
+            # Essayer de dÃ©marrer et rÃ©cupÃ©rer un frame
+            start_success = camera.start()
+            frame_success = False
+            resolution = None
+            
+            if start_success:
+                # Attendre un peu pour avoir des frames
+                time.sleep(1)
+                
+                # Essayer de rÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                frame_success = success
+                
+                if success and frame is not None:
+                    height, width = frame.shape[:2]
+                    resolution = {"width": width, "height": height}
+            
+            if not start_success:
+                raise RuntimeError(f"Impossible de dÃ©marrer la capture pour {recording.camera_url}")
+            
+            # Enregistrer le stream
+            recording.camera_stream = camera
+            recording.status = 'recording'
+            recording.recording_type = 'opencv'
+            recording.start_time = datetime.now()
+            
+            # Lancer le thread d'enregistrement OpenCV
+            record_thread = threading.Thread(
+                target=self._opencv_recording_thread,
+                args=(recording.session_id, recording),
+                daemon=True
+            )
+            record_thread.start()
+            
+            # Timer auto-stop sÃ©curitÃ©
+            threading.Timer(
+                self.max_recording_duration,
+                lambda: self._auto_timeout_stop(recording.session_id)
+            ).start()
+            
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur lors du dÃ©marrage d'OpenCV: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    
+    def _opencv_recording_thread(self, session_id: str, recording: RecordingTask):
+        """Thread d'enregistrement vidÃ©o avec OpenCV"""
+        try:
+            camera = self.camera_streams.get(session_id)    
+            if not camera:
+                raise RuntimeError(f"Stream camÃ©ra non trouvÃ© pour {session_id}")
+            
+            # RÃ©cupÃ©rer un premier frame pour obtenir les dimensions    
+            success, frame = camera.get_frame()
+            if not success or frame is None:
+                raise RuntimeError("Impossible d'obtenir le premier frame")
+            
+            height, width = frame.shape[:2]
+            fps = self.video_quality['fps']
+            
+            # Configuration de l'encodeur
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(recording.output_path, fourcc, fps, (width, height))
+            
+            start_time = time.time()
+            frame_count = 0
+            last_frame_time = start_time
+            
+            while True:
+                # VÃ©rifier si on doit s'arrÃªter
+                with self.lock:
+                    if session_id not in self.recordings or self.recordings[session_id].status == 'stopping':
+                        break
+                
+                # RÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                if not success or frame is None:
+                    time.sleep(0.01)  # Pause courte pour Ã©viter CPU 100%
+                    continue
+                
+                # Ãcrire le frame
+                out.write(frame)
+                frame_count += 1
+                
+                # Respecter le FPS cible
+                current_time = time.time()
+                target_time = last_frame_time + (1.0 / fps)
+                if current_time < target_time:
+                    time.sleep(target_time - current_time)
+                
+                last_frame_time = time.time()
+            
+            # Nettoyer les ressources
+            out.release()
+            logger.info(f"â Enregistrement OpenCV terminÃ©: {session_id}, {frame_count} frames")
+            
+        except Exception as e:
+            logger.error(f"â Erreur dans le thread OpenCV pour {session_id}: {e}")
+        except Exception as e:
+            logger.error(f"â Erreur dans le thread OpenCV pour {session_id}: {e}")
+            with self.lock:
+                if session_id in self.recordings:
+                    self.recordings[session_id].status = 'error'
+                    self.recordings[session_id].error = str(e)
+    
+    def _auto_timeout_stop(self, session_id: str):
+        with self.lock:
+            if session_id in self.recordings and \
+               self.recordings[session_id].status == 'recording':
+                logger.warning(f"â±ï¸ Auto-stop (durÃ©e max atteinte) session {session_id}")
+                try:
+                    self.stop_recording(session_id)
+                except Exception as e:
+                    logger.error(f"Erreur auto-stop: {e}")
+
+    def _finalize_recording(self, session_id: str) -> Dict[str, Any]:
+        """Finalise l'enregistrement et crÃ©e l'entrÃ©e en base (tolÃ©rant si ffprobe absent)."""
+        try:
+            recording = self.recordings[session_id]
+            if not os.path.exists(recording.output_path):
+                return {'status':'error','error':f"Fichier vidÃ©o non trouvÃ©: {recording.output_path}", 'message':'Finalisation impossible'}
+            duration_seconds = None
+            nb_frames = None
+            probe_ok = False
+            try:
+                probe_cmd = [
+                    FFPROBE_PATH,
+                    '-v','error',
+                    '-select_streams','v:0',
+                    '-show_entries','stream=duration,nb_frames',
+                    '-of','default=noprint_wrappers=1',
+                    recording.output_path
+                ]
+                probe = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=12)
+                probe_ok = probe.returncode == 0
+                if probe_ok:
+                    for line in probe.stdout.splitlines():
+                        if line.startswith('duration='):
+                            try: duration_seconds = float(line.split('=')[1])
+                            except: pass
+                        elif line.startswith('nb_frames='):
+                            try: nb_frames = int(line.split('=')[1])
+                            except: pass
+                else:
+                    if 'moov atom not found' in probe.stderr.lower():
+                        logger.error(f"â moov absent {session_id}")
+            except FileNotFoundError:
+                logger.warning("ffprobe introuvable - fallback estimation durÃ©e")
+            except Exception as pe:
+                logger.warning(f"Probe Ã©chec: {pe}")
+            file_size = self._get_file_size(recording.output_path)
+            wallclock_secs = (datetime.now()-recording.start_time).total_seconds()
+            if duration_seconds is None:
+                duration_seconds = max(1, int(wallclock_secs))
+            target_fps = self.video_quality.get('fps',25)
+            est_from_frames = (nb_frames/target_fps) if (nb_frames and target_fps) else None
+            if est_from_frames and abs(est_from_frames - wallclock_secs) > 5:
+                logger.warning(
+                    f"â±ï¸ Ecart durÃ©e: wallclock={wallclock_secs:.1f}s ffprobe={duration_seconds:.1f}s frames_est={est_from_frames:.1f}s nb_frames={nb_frames}")
+            # Ãtirement si ratio important (>1.5) et frames_est proche durÃ©e actuelle (indiquant timestamps compressÃ©s)
+            stretched = False
+            backup_path = None
+            if wallclock_secs > 6 and duration_seconds > 0 and wallclock_secs/duration_seconds > 1.5:
+                ratio = wallclock_secs / duration_seconds
+                ok, new_dur, backup_path = self._stretch_video_duration(recording.output_path, ratio)
+                if ok and new_dur > duration_seconds:
+                    duration_seconds = new_dur
+                    stretched = True
+            # Reprobe aprÃ¨s Ã©ventuel stretch (durÃ©e plus prÃ©cise)
+            if stretched:
+                try:
+                    probe2 = subprocess.run([
+                        FFPROBE_PATH,'-v','error','-select_streams','v:0','-show_entries','stream=duration','-of','default=noprint_wrappers=1',recording.output_path
+                    ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True,timeout=8)
+                    if probe2.returncode==0:
+                        for line in probe2.stdout.splitlines():
+                            if line.startswith('duration='):
+                                try: duration_seconds=float(line.split('=')[1])
+                                except: pass
+                except Exception:
+                    pass
+            # Rejet si fichier trÃ¨s court avant crÃ©ation DB
+            if duration_seconds < 3 or file_size < 200*1024:
+                return {'status':'error','error':'Fichier incomplet','file_size':file_size,'duration':duration_seconds,'nb_frames':nb_frames}
+            thumb = self._generate_thumbnail(recording.output_path, recording.session_id)
+            video = Video(
+                title=recording.session_name,
+                file_url=f"/videos/{os.path.basename(recording.output_path)}",
+                thumbnail_url=f"/thumbnails/{recording.session_id}.jpg" if thumb else None,
+                duration=int(duration_seconds),
+                file_size=file_size,
+                court_id=recording.court_id,
+                user_id=recording.user_id,
+                recorded_at=recording.start_time,
+                is_unlocked=False,
+                credits_cost=10,
+            )
+            db.session.add(video); db.session.commit()
+            logger.info(
+                f"â VidÃ©o validÃ©e {video.id} dur={duration_seconds:.1f}s wallclock={wallclock_secs:.1f}s nb_frames={nb_frames} taille={file_size} stretched={stretched}")
+            return {
+                'status':'completed',
+                'video_id':video.id,
+                'video_filename':os.path.basename(recording.output_path),
+                'duration':int(duration_seconds),
+                'wallclock_duration':int(wallclock_secs),
+                'nb_frames':nb_frames,
+                'file_size':file_size,
+                'thumbnail_url':video.thumbnail_url,
+                'stretched': stretched,
+                'original_backup': backup_path if stretched else None
+            }
+        except Exception as e:
+            logger.error(f"â Finalisation erreur: {e}")
+            return {'status':'error','error':str(e)}
+    
+    def test_camera_connection(self, camera_url: str) -> Dict[str, Any]:
+        """
+        Teste la connexion Ã  une camÃ©ra.
+        
+        Args:
+            camera_url: URL de la camÃ©ra Ã  tester
+            
+        Returns:
+            RÃ©sultat du test
+        """
+        try:
+            logger.info(f"ð Test de connexion Ã  la camÃ©ra: {camera_url}")
+            
+            # CrÃ©er un stream de camÃ©ra temporaire
+            camera = CameraStream(camera_url)
+            
+            # Essayer de dÃ©marrer et rÃ©cupÃ©rer un frame
+            start_success = camera.start()
+            frame_success = False
+            resolution = None
+            
+            if start_success:
+                # Attendre un peu pour avoir des frames
+                time.sleep(1)
+                
+                # Essayer de rÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                if success and frame is not None:
+                    height, width = frame.shape[:2]
+                    resolution = {"width": width, "height": height}
+            
+            # ArrÃªter proprement
+            camera.stop()
+            
+            return {
+                'status': 'success' if start_success and frame_success else 'error',
+                'connection': start_success,
+                'frames_available': frame_success,
+                'resolution': resolution,
+                'error': camera.last_error,
+                'url': camera_url
+            }
+            
+        except Exception as e:
+            logger.error(f"â Erreur lors du test de la camÃ©ra: {e}")
+            return {
+                'status': 'error',
+                'connection': False,
+                'frames_available': False,
+                'error': str(e),
+                'url': camera_url
+            }
+    
+    # ------ MÃ©thodes privÃ©es ------
+    
+    def _validate_court(self, court_id: int) -> Court:
+        """Valide et rÃ©cupÃ¨re un terrain"""
+        court = Court.query.get(court_id)
+        if not court:
+            raise ValueError(f"Terrain {court_id} non trouvÃ©")
+        return court
+    
+    def _validate_user(self, user_id: int) -> User:
+        """Valide et rÃ©cupÃ¨re un utilisateur"""
+        user = User.query.get(user_id)
+        if not user:
+            raise ValueError(f"Utilisateur {user_id} non trouvÃ©")
+        return user
+    
+    def _get_camera_url(self, court: Court) -> str:
+        """RÃ©cupÃ¨re l'URL de la camÃ©ra pour un terrain"""
+        if hasattr(court, 'camera_url') and court.camera_url:
+            return court.camera_url
+        else:
+            # URL de simulation pour les tests
+            return f"http://localhost:5000/api/courts/{court.id}/camera_stream"
+    
+    def _is_rtsp_url(self, url: str) -> bool:
+        """DÃ©termine si l'URL est un flux RTSP"""
+        return url.lower().startswith(('rtsp://', 'rtsps://'))
+    
+    def _is_mjpeg_url(self, url: str) -> bool:
+        """DÃ©termine si l'URL est un flux MJPEG"""
+        url_lower = url.lower()
+        return (url_lower.endswith(('.mjpg', '.mjpeg', '.cgi')) or 
+                'mjpg' in url_lower or 'mjpeg' in url_lower)
+    
+    def _start_mjpeg_recording_segmented(self, recording: RecordingTask) -> bool:
+        """Ancien mode segmentÃ©: utilise MJPEGRecordingManager (upload par segments)."""
+        try:
+            result = self.mjpeg_manager.start_recording(
+                recording_id=recording.session_id,
+                mjpeg_url=recording.camera_url,
+                session_name=recording.session_name,
+                segment_duration=300  # configurable via futur env si besoin
+            )
+            recording.recording_type = 'mjpeg_bunny'
+            recording.bunny_session_id = result['session_id']
+            recording.status = 'recording'
+            recording.start_time = datetime.now()
+            logger.info(f"ð¬ (Segmented) Enregistrement MJPEG dÃ©marrÃ© vers Bunny: {recording.session_id}")
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur dÃ©marrage MJPEG segmentÃ©: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+
+    def _spawn_ffmpeg_process(self, cmd: list, session_id: str):
+        """Lance FFmpeg avec stdin PIPE pour pouvoir envoyer 'q' et lit stderr en arriÃ¨re-plan.
+        EmpÃªche le blocage des pipes (memory leak) et permet un arrÃªt propre Ã©crivant l'atome moov."""
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        # Thread lecteur stderr (Ã©vite remplissage buffer)
+        def _drain():
+            try:
+                for line in process.stderr:
+                    if not line:
+                        break
+                    if 'frame=' in line or 'fps=' in line:
+                        continue  # trop verbeux
+                    logger.debug(f"FFmpeg[{session_id}]: {line.strip()}")
+            except Exception:
+                pass
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        return process
+
+    def _graceful_stop_ffmpeg(self, process: subprocess.Popen, session_id: str):
+        """Tente un arrÃªt doux (envoie 'q') pour que FFmpeg Ã©crive la fin du conteneur MP4."""
+        if process.poll() is not None:
+            return
+        try:
+            if process.stdin:
+                try:
+                    process.stdin.write('q')
+                    process.stdin.flush()
+                except Exception:
+                    pass
+            # Attendre Ã©criture trailer
+            process.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            try:
+                process.terminate()  # Windows: TerminateProcess
+                process.wait(timeout=4)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+    def _start_mjpeg_recording_single(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement MJPEG (mode single) avec cadence temps rÃ©el corrigÃ©e.
+        Ajustements:
+          - DÃ©placer le framerate en option D'ENTRÃE (-framerate) avant -i pour que FFmpeg gÃ©nÃ¨re des timestamps espacÃ©s
+          - Retirer combo '-vsync cfr -r <fps>' en sortie qui compressait le temps lorsque les frames arrivaient en rafale
+          - Conserver -re pour limiter la lecture si applicable
+        """
+        try:
+            target_fps = str(self.video_quality.get('fps', 25))
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                '-hide_banner', '-loglevel', 'info',
+                '-re',
+                '-f', 'mjpeg',
+                '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+                '-thread_queue_size', '1024',
+                '-framerate', target_fps,  # (<- IMPORTANT: option d'entrÃ©e)
+                '-i', recording.camera_url,
+                '-fflags', '+genpts',
+                '-use_wallclock_as_timestamps', '1',
+                # Sortie sans forcer vsync/r de nouveau; laisser ffmpeg utiliser le framerate d'entrÃ©e
+                '-c:v', 'libx264',
+                '-preset', self.video_quality['preset'],
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'main',
+                '-movflags', '+faststart',
+                '-crf', '23',
+                '-g', str(int(target_fps) * 2),
+                '-an',
+                recording.output_path
+            ]
+            logger.info(f"ð¬ (Single) FFmpeg MJPEG cmd: {' '.join(ffmpeg_cmd)}")
+            process = self._spawn_ffmpeg_process(ffmpeg_cmd, recording.session_id)
+            if process.poll() is not None:
+                raise RuntimeError('FFmpeg non dÃ©marrÃ©')
+            self.recording_processes[recording.session_id] = process
+            recording.status = 'recording'
+            recording.process = process
+            recording.recording_type = 'mjpeg_single'
+            recording.start_time = datetime.now()
+            threading.Timer(self.max_recording_duration, lambda: self._auto_timeout_stop(recording.session_id)).start()
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur dÃ©marrage MJPEG single: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    def _start_ffmpeg_recording(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement avec FFmpeg (RTSP)."""
+        try:
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                '-rtsp_transport', 'tcp',
+                '-i', recording.camera_url,
+                '-c:v', 'libx264',
+                '-preset', self.video_quality['preset'],
+                '-tune', self.video_quality['tune'],
+                '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                recording.output_path
+            ]
+            logger.info(f"ð¬ DÃ©marrage FFmpeg RTSP: {recording.session_id}")
+            process = self._spawn_ffmpeg_process(ffmpeg_cmd, recording.session_id)
+            if process.poll() is not None:
+                raise RuntimeError("FFmpeg n'a pas pu dÃ©marrer")
+            self.recording_processes[recording.session_id] = process        
+            recording.status = 'recording'
+            recording.process = process
+            recording.recording_type = 'rtsp'
+            recording.start_time = datetime.now()
+            threading.Timer(
+                self.max_recording_duration,
+                lambda: self._auto_timeout_stop(recording.session_id)
+            ).start()
+            return True
+        except Exception as e:
+            logger.error(f"â Erreur lors du dÃ©marrage de FFmpeg: {e}")
+            recording.status = 'error'
+            recording.error = str(e)
+            return False
+    
+    def _start_opencv_recording(self, recording: RecordingTask) -> bool:
+        """DÃ©marre un enregistrement avec OpenCV"""
+        try:
+            # CrÃ©er un stream camÃ©ra
+            camera = CameraStream(recording.camera_url)
+            
+            # Essayer de dÃ©marrer et rÃ©cupÃ©rer un frame
+            start_success = camera.start()
+            frame_success = False
+            resolution = None
+            
+            if start_success:
+                # Attendre un peu pour avoir des frames
+                time.sleep(1)
+                
+                # Essayer de rÃ©cupÃ©rer un frame
+                success, frame = camera.get_frame()
+                frame_success = success
+                
+                if success and frame is not None:
+                    height, width  =   f r a m e . s h a p e [ : 2 ] 
+                                         r e s o l u t i o n   =   { \ 
+ 
+ w i d t h \ :   w i d t h ,   \ h e i g h t \ :   h e i g h t } 
+                         
+                         #   A r r ê t e r   p r o p r e m e n t 
+                         c a m e r a . s t o p ( ) 
+                         
+                         r e t u r n   { 
+                                 ' s t a t u s ' :   ' s u c c e s s '   i f   s t a r t _ s u c c e s s   a n d   f r a m e _ s u c c e s s   e l s e   ' e r r o r ' , 
+                                 ' c o n n e c t i o n ' :   s t a r t _ s u c c e s s , 
+                                 ' f r a m e s _ a v a i l a b l e ' :   f r a m e _ s u c c e s s , 
+                                 ' r e s o l u t i o n ' :   r e s o l u t i o n , 
+                                 ' e r r o r ' :   c a m e r a . l a s t _ e r r o r   i f   h a s a t t r ( c a m e r a ,   ' l a s t _ e r r o r ' )   e l s e   N o n e , 
+                                 ' u r l ' :   c a m e r a _ u r l 
+                         } 
+                         
+                 e x c e p t   E x c e p t i o n   a s   e : 
+                         l o g g e r . e r r o r ( f \ L'
+ 
+ E r r e u r 
+ 
+ l o r s 
+ 
+ d u 
+ 
+ t e s t 
+ 
+ d e 
+ 
+ l a 
+ 
+ c a m é r a : 
+ 
+ e 
+ 
+ \ ) 
+                         r e t u r n   { 
+                                 ' s t a t u s ' :   ' e r r o r ' , 
+                                 ' c o n n e c t i o n ' :   F a l s e , 
+                                 ' f r a m e s _ a v a i l a b l e ' :   F a l s e , 
+                                 ' e r r o r ' :   s t r ( e ) , 
+                                 ' u r l ' :   c a m e r a _ u r l 
+                         } 
+ 
+ 

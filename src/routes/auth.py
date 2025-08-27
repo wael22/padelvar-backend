@@ -273,3 +273,43 @@ def google_authenticate():
         logger.error(f"Erreur lors de l'authentification Google: {e}")
         traceback.print_exc()
         return jsonify({'error': 'Erreur lors de l\'authentification Google'}), 500
+
+
+# Fonctions utilitaires pour l'authentification
+from functools import wraps
+
+def get_current_user():
+    """
+    Récupère l'utilisateur actuellement connecté depuis la session
+    Retourne None si aucun utilisateur n'est connecté
+    """
+    user_id = session.get('user_id')
+    if not user_id:
+        return None
+    return User.query.get(user_id)
+
+def require_auth(f):
+    """
+    Décorateur pour protéger les routes qui nécessitent une authentification
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({'error': 'Authentification requise'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def require_admin(f):
+    """
+    Décorateur pour protéger les routes qui nécessitent des privilèges admin
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({'error': 'Authentification requise'}), 401
+        if current_user.role not in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
+            return jsonify({'error': 'Privilèges administrateur requis'}), 403
+        return f(*args, **kwargs)
+    return decorated_function

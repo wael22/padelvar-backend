@@ -2,22 +2,6 @@
 
 from datetime import datetime
 from enum import Enum
-## Suppression de l'import enum
-from .database import db
-from werkzeug.security import generate_password_hash, check_password_hash
-
-# --- Énumérations pour les Rôles et Actions ---
-
-class UserRole(Enum):
-    SUPER_ADMIN = "super_admin"
-    PLAYER = "player"
-    CLUB = "club"
-
-# --- Table d'Association pour les Joueurs qui suivent des Clubs ---
-
-
-from datetime import datetime
-from enum import Enum
 from .database import db
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import event
@@ -30,6 +14,30 @@ class UserRole(Enum):
     SUPER_ADMIN = "super_admin"
     PLAYER = "player"
     CLUB = "club"
+
+class UserStatus(Enum):
+    ACTIVE = "active"
+    PENDING_VERIFICATION = "pending_verification"
+    SUSPENDED = "suspended"
+    INACTIVE = "inactive"
+
+class TransactionStatus(Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    REFUNDED = "refunded"
+
+class NotificationType(Enum):
+    VIDEO_READY = "video_ready"
+    RECORDING_STARTED = "recording_started"
+    RECORDING_STOPPED = "recording_stopped"
+    CREDITS_ADDED = "credits_added"
+    PAYMENT_SUCCESS = "payment_success"
+    PAYMENT_FAILED = "payment_failed"
+    ACCOUNT_SUSPENDED = "account_suspended"
+    SESSION_EXPIRED = "session_expired"
+    SYSTEM_MAINTENANCE = "system_maintenance"
 
 player_club_follows = db.Table(
     'player_club_follows',
@@ -45,8 +53,12 @@ class User(db.Model):
     name = db.Column(db.String(100), nullable=False)
     phone_number = db.Column(db.String(20), nullable=True)
     role = db.Column(db.Enum(UserRole), nullable=False, default=UserRole.PLAYER)
+    status = db.Column(db.Enum(UserStatus), nullable=False, default=UserStatus.ACTIVE)
     credits_balance = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login_at = db.Column(db.DateTime, nullable=True)
+    email_verified_at = db.Column(db.DateTime, nullable=True)
     google_id = db.Column(db.String(100), nullable=True, unique=True)  # ID Google pour l'authentification
     
     videos = db.relationship('Video', backref='owner', lazy=True, cascade='all, delete-orphan')
@@ -64,8 +76,12 @@ class User(db.Model):
             'name': self.name,
             'phone_number': self.phone_number,
             'role': self.role.value,
+            'status': self.status.value,
             'credits_balance': self.credits_balance,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'last_login_at': self.last_login_at.isoformat() if self.last_login_at else None,
+            'email_verified_at': self.email_verified_at.isoformat() if self.email_verified_at else None,
             'club_id': self.club_id
         }
         if self.role == UserRole.CLUB and self.club_id:
@@ -268,6 +284,158 @@ class ClubActionHistory(db.Model):
             'action_details': self.action_details,
             'performed_at': self.performed_at.isoformat() if self.performed_at else None
         }
+
+class Transaction(db.Model):
+    """Modèle pour gérer les transactions de paiement et d'achat de crédits"""
+    __tablename__ = 'transaction'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    # Identifiant unique pour l'idempotence
+    idempotency_key = db.Column(db.String(100), unique=True, nullable=True)
+    
+    # Relation utilisateur
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user = db.relationship('User', backref='transactions')
+    
+    # Type et détails de la transaction
+    transaction_type = db.Column(db.String(50), nullable=False)  # 'credit_purchase', 'credit_usage', 'refund'
+    package_name = db.Column(db.String(100), nullable=True)  # '10_credits', '50_credits', etc.
+    credits_amount = db.Column(db.Integer, nullable=False)  # Nombre de crédits
+    
+    # Montant financier (en centimes pour éviter les problèmes de virgule)
+    amount_cents = db.Column(db.Integer, nullable=True)  # Prix en centimes
+    currency = db.Column(db.String(3), default='EUR')  # Code devise ISO
+    
+    # Statut et prestataire de paiement
+    status = db.Column(db.Enum(TransactionStatus), nullable=False, default=TransactionStatus.PENDING)
+    payment_gateway = db.Column(db.String(50), nullable=True)  # 'stripe', 'paypal', etc.
+    payment_gateway_id = db.Column(db.String(100), nullable=True)  # ID transaction chez le prestataire
+    payment_intent_id = db.Column(db.String(100), nullable=True)  # Stripe Payment Intent ID
+    
+    # Métadonnées
+    description = db.Column(db.Text, nullable=True)
+    failure_reason = db.Column(db.Text, nullable=True)
+    
+    # Dates
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    cancelled_at = db.Column(db.DateTime, nullable=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'idempotency_key': self.idempotency_key,
+            'user_id': self.user_id,
+            'transaction_type': self.transaction_type,
+            'package_name': self.package_name,
+            'credits_amount': self.credits_amount,
+            'amount_euros': self.amount_cents / 100.0 if self.amount_cents else None,
+            'currency': self.currency,
+            'status': self.status.value,
+            'payment_gateway': self.payment_gateway,
+            'payment_gateway_id': self.payment_gateway_id,
+            'description': self.description,
+            'failure_reason': self.failure_reason,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'cancelled_at': self.cancelled_at.isoformat() if self.cancelled_at else None
+        }
+
+class Notification(db.Model):
+    """Modèle pour gérer les notifications utilisateur"""
+    __tablename__ = 'notification'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    
+    # Relation utilisateur
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user = db.relationship('User', backref='notifications')
+    
+    # Contenu de la notification
+    title = db.Column(db.String(200), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    notification_type = db.Column(db.Enum(NotificationType), nullable=False)
+    
+    # Statut et priorité
+    is_read = db.Column(db.Boolean, default=False)
+    is_archived = db.Column(db.Boolean, default=False)
+    priority = db.Column(db.String(10), default='normal')  # 'low', 'normal', 'high', 'urgent'
+    
+    # Métadonnées optionnelles pour des actions spécifiques
+    related_resource_type = db.Column(db.String(50), nullable=True)  # 'video', 'transaction', 'recording'
+    related_resource_id = db.Column(db.String(100), nullable=True)  # ID de la ressource liée
+    
+    # Actions possibles (pour les notifications interactives)
+    action_url = db.Column(db.String(500), nullable=True)  # URL d'action (bouton dans la notification)
+    action_label = db.Column(db.String(100), nullable=True)  # Texte du bouton
+    
+    # Dates
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    read_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True)  # Date d'expiration de la notification
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'title': self.title,
+            'message': self.message,
+            'notification_type': self.notification_type.value,
+            'is_read': self.is_read,
+            'is_archived': self.is_archived,
+            'priority': self.priority,
+            'related_resource_type': self.related_resource_type,
+            'related_resource_id': self.related_resource_id,
+            'action_url': self.action_url,
+            'action_label': self.action_label,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'read_at': self.read_at.isoformat() if self.read_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None
+        }
+        
+    def mark_as_read(self):
+        """Marquer la notification comme lue"""
+        if not self.is_read:
+            self.is_read = True
+            self.read_at = datetime.utcnow()
+            
+    def is_expired(self):
+        """Vérifier si la notification a expiré"""
+        if not self.expires_at:
+            return False
+        return datetime.utcnow() > self.expires_at
+
+class IdempotencyKey(db.Model):
+    """Modèle pour gérer l'idempotence des requêtes critiques"""
+    __tablename__ = 'idempotency_key'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)  # Optionnel
+    endpoint = db.Column(db.String(100), nullable=False)  # Endpoint concerné
+    
+    # Réponse stockée pour rejouer la même réponse
+    response_status_code = db.Column(db.Integer, nullable=True)
+    response_body = db.Column(db.Text, nullable=True)
+    response_headers = db.Column(db.Text, nullable=True)  # JSON stringifié
+    
+    # Métadonnées
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)  # Clé expire après 24h
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'key': self.key,
+            'user_id': self.user_id,
+            'endpoint': self.endpoint,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None
+        }
+        
+    def is_expired(self):
+        """Vérifier si la clé d'idempotence a expiré"""
+        return datetime.utcnow() > self.expires_at
 
 # ====================================================================
 # CONFIGURATION DE LA SYNCHRONISATION BIDIRECTIONNELLE

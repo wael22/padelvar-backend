@@ -1,0 +1,109 @@
+{
+  "timestamp": "2025-08-18T20:55:23.283103",
+  "total_tests": 9,
+  "passed_tests": 1,
+  "failed_tests": 7,
+  "warnings": 1,
+  "performance_metrics": {},
+  "security_checks": {
+    "configuration": [
+      "SECRET_KEY_configured",
+      "STRIPE_SECRET_KEY_MISSING",
+      "DATABASE_URL_MISSING"
+    ],
+    "idempotence": [
+      "ERROR_unexpected character"
+    ],
+    "input_validation": [
+      "ERROR_No module named 'str"
+    ],
+    "error_handling": [
+      "graceful_error_handling"
+    ]
+  },
+  "details": {
+    "Configuration Dynamique": {
+      "status": "error",
+      "message": "Erreur test config: Config.get_database_uri() missing 1 required positional argument: 'app'",
+      "execution_time": 0.0006313323974609375,
+      "category": "configuration"
+    },
+    "Intégration Service Paiement": {
+      "status": "error",
+      "message": "Import service paiement échoué: No module named 'stripe'",
+      "execution_time": 0.14842891693115234,
+      "category": "integration"
+    },
+    "Fonctionnalité Idempotence": {
+      "status": "error",
+      "message": "Erreur test idempotence: unexpected character after line continuation character (idempotence.py, line 220)",
+      "execution_time": 0.0026552677154541016,
+      "category": "security"
+    },
+    "Monitoring Système": {
+      "status": "success",
+      "message": "Monitoring système opérationnel (mémoire: 23.6%)",
+      "details": {
+        "memory_percent": 23.6,
+        "memory_ok": true,
+        "ffmpeg_cleaned": 0,
+        "process_detection": true,
+        "all_functions_work": true
+      },
+      "execution_time": 0.0032029151916503906,
+      "category": "monitoring"
+    },
+    "Tâches Celery": {
+      "status": "error",
+      "message": "Import tâches Celery échoué: No module named 'celery'",
+      "execution_time": 0.0006878376007080078,
+      "category": "async"
+    },
+    "Intégration Application": {
+      "status": "error",
+      "message": "Import app échoué: No module named 'flask'",
+      "execution_time": 0.0003306865692138672,
+      "category": "integration"
+    },
+    "Métriques Performance": {
+      "status": "error",
+      "message": "Erreur test performance: unexpected character after line continuation character (idempotence.py, line 220)",
+      "execution_time": 0.0018880367279052734,
+      "category": "performance"
+    },
+    "Validation Sécurité": {
+      "status": "warning",
+      "message": "Sécurité acceptable (4 issues mineures)",
+      "details": {
+        "configuration": [
+          "SECRET_KEY_configured",
+          "STRIPE_SECRET_KEY_MISSING",
+          "DATABASE_URL_MISSING"
+        ],
+        "idempotence": [
+          "ERROR_unexpected character"
+        ],
+        "input_validation": [
+          "ERROR_No module named 'str"
+        ],
+        "error_handling": [
+          "graceful_error_handling"
+        ]
+      },
+      "execution_time": 0.0018308162689208984,
+      "category": "security"
+    },
+    "Résilience au Stress": {
+      "status": "error",
+      "message": "Faible résilience (4 problèmes détectés)",
+      "details": {
+        "import_errors": 3,
+        "function_errors": 0,
+        "memory_stable": true,
+        "concurrent_safe": false
+      },
+      "execution_time": 0.11242294311523438,
+      "category": "resilience"
+    }
+  }
+}

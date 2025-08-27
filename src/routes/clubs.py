@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, session
 from src.models.user import db, User, Club, Court, UserRole, ClubActionHistory, Video, RecordingSession
 from datetime import datetime, timedelta
 import json
+import os
 import random
 import logging
 from werkzeug.security import generate_password_hash
@@ -242,14 +243,25 @@ def get_club_dashboard():
         courts_count = len(courts)
         print(f"Nombre de terrains: {courts_count}")
         
-        # NOTE: Ne pas nettoyer automatiquement les sessions expirées ici
-        # pour permettre de voir les terrains "Occupé" même quand ils viennent d'expirer
-        # Le nettoyage se fera dans d'autres endpoints
-        # from src.routes.recording import cleanup_expired_sessions
-        # try:
-        #     cleanup_expired_sessions()
-        # except Exception as e:
-        #     print(f"Erreur lors du nettoyage des sessions expirées: {e}")
+        # ACTIVATION: Nettoyer automatiquement les sessions expirées
+        # pour libérer les terrains qui ne sont plus réellement occupés
+        try:
+            # Nettoyer les sessions expirées
+            expired_sessions = RecordingSession.query.filter_by(status='active').all()
+            cleaned_count = 0
+            
+            for session in expired_sessions:
+                if session.is_expired():
+                    session.status = 'completed'
+                    cleaned_count += 1
+                    print(f"Nettoyage session expirée {session.id} (Court {session.court_id})")
+            
+            if cleaned_count > 0:
+                db.session.commit()
+                print(f"✅ {cleaned_count} session(s) expirée(s) nettoyée(s)")
+                
+        except Exception as e:
+            print(f"Erreur lors du nettoyage des sessions expirées: {e}")
         
         # Enrichir les informations des terrains avec le statut d'occupation
         courts_with_status = []
@@ -1370,12 +1382,12 @@ def stop_court_recording(court_id):
         if not user:
             return jsonify({'error': 'Non authentifié'}), 401
         
-        if user.role != UserRole.CLUB:
-            return jsonify({'error': 'Seuls les clubs peuvent arrêter les enregistrements'}), 403
+        if user.role not in [UserRole.CLUB, UserRole.SUPER_ADMIN]:
+            return jsonify({'error': 'Seuls les clubs et super admins peuvent arrêter les enregistrements'}), 403
         
-        # Vérifier que le terrain appartient au club
+        # Vérifier que le terrain appartient au club (sauf pour super admin)
         court = Court.query.get_or_404(court_id)
-        if court.club_id != user.club.id:
+        if user.role == UserRole.CLUB and court.club_id != user.club.id:
             return jsonify({'error': 'Ce terrain ne vous appartient pas'}), 403
         
         # Importer les classes nécessaires
@@ -1419,21 +1431,121 @@ def stop_court_recording(court_id):
             duration_minutes = 1
             print(f"  Fallback: durée fixée à 1 minute")
         
+        # Arrêter l'enregistrement vidéo physique
+        from src.services.video_capture_service_ultimate import DirectVideoCaptureService
+        video_capture_service = DirectVideoCaptureService()
+        
+        try:
+            # Arrêter le processus d'enregistrement et finaliser le fichier
+            stop_result = video_capture_service.stop_recording(active_recording.recording_id)
+            logger.info(f"Arrêt enregistrement: {stop_result}")
+        except Exception as e:
+            logger.warning(f"Erreur lors de l'arrêt du service vidéo: {e}")
+            stop_result = False
+        
         # Créer automatiquement une vidéo pour le joueur
         video_title = active_recording.title or f"Match du {active_recording.start_time.strftime('%d/%m/%Y')} - {court.name}"
+        
+        # Déterminer l'URL du fichier vidéo
+        video_file_url = None
+        if stop_result:  # Le service renvoie True si succès
+            # Chercher le fichier dans le dossier standard
+            expected_file = f"static/videos/{active_recording.recording_id}.mp4"
+            if os.path.exists(expected_file):
+                video_file_url = expected_file
+                logger.info(f"Fichier vidéo trouvé: {expected_file}")
+            else:
+                logger.warning(f"Fichier vidéo non trouvé: {expected_file}")
+        else:
+            # Fallback : chercher le fichier même si l'arrêt a échoué
+            expected_file = f"static/videos/{active_recording.recording_id}.mp4"
+            if os.path.exists(expected_file):
+                video_file_url = expected_file
+                logger.info(f"Fichier vidéo trouvé en fallback: {expected_file}")
+            else:
+                logger.warning(f"Fichier vidéo non trouvé: {expected_file}")
         
         new_video = Video(
             title=video_title,
             description=active_recording.description or f"Enregistrement automatique sur {court.name}",
-            duration=duration_minutes,
+            duration=duration_minutes,  # ⚠️ TEMPORAIRE - sera corrigé ci-dessous
             user_id=active_recording.user_id,
             court_id=court_id,
             recorded_at=active_recording.start_time,
+            file_url=video_file_url,  # ✅ Ajouter l'URL du fichier
             is_unlocked=True,  # Vidéo débloquée automatiquement
             credits_cost=0     # Pas de coût puisque l'enregistrement a été arrêté par le club
         )
         
+        # 🔍 CORRECTION CRITIQUE - Vérifier durée réelle du fichier (comme dans recording.py)
+        if video_file_url and os.path.exists(video_file_url):
+            try:
+                logger.info(f"🔍 Vérification durée réelle fichier: {video_file_url}")
+                
+                # Attendre que le fichier soit complètement finalisé
+                import time
+                time.sleep(2)
+                
+                # Utiliser ffprobe pour obtenir la durée réelle
+                ffprobe_result = video_capture_service._get_video_duration_ffprobe(video_file_url)
+                
+                if ffprobe_result:
+                    real_duration_seconds = ffprobe_result['duration']
+                    real_duration_minutes = real_duration_seconds / 60
+                    difference_seconds = abs(real_duration_seconds - (duration_minutes * 60))
+                    
+                    logger.info(f"📊 COMPARAISON DURÉES (route clubs):")
+                    logger.info(f"   🗄️ DB (calcul): {duration_minutes:.2f} min = {duration_minutes * 60:.0f}s")
+                    logger.info(f"   🎥 Fichier réel: {real_duration_minutes:.2f} min = {real_duration_seconds:.0f}s")
+                    logger.info(f"   📈 Différence: {difference_seconds:.0f}s")
+                    
+                    if difference_seconds > 10:  # Différence significative
+                        logger.warning(f"⚠️ ÉCART IMPORTANT: {difference_seconds:.0f}s - utilisation durée réelle")
+                        new_video.duration = real_duration_seconds  # ✅ Correction durée
+                    else:
+                        logger.info("✅ Durées cohérentes")
+                        new_video.duration = real_duration_seconds  # ✅ Utiliser durée précise même si cohérente
+                        
+                    logger.info(f"🎯 DURÉE FINALE clubs.py: {new_video.duration:.0f}s")
+                else:
+                    logger.warning("⚠️ Impossible de lire durée réelle - utilisation durée DB")
+                    new_video.duration = duration_minutes * 60  # Conversion en secondes
+            except Exception as e:
+                logger.error(f"❌ Erreur lecture durée réelle: {e}")
+                new_video.duration = duration_minutes * 60
+        else:
+            logger.warning("⚠️ Pas de fichier pour vérification - utilisation durée DB")
+            new_video.duration = duration_minutes * 60
+        
         db.session.add(new_video)
+        
+        # Upload automatique vers Bunny CDN si le fichier existe
+        if video_file_url and os.path.exists(video_file_url):
+            try:
+                from src.services.bunny_storage_service import bunny_storage_service
+                
+                logger.info(f"🚀 Début upload vers Bunny CDN: {video_file_url}")
+                
+                # Déclencher l'upload en arrière-plan
+                upload_id = bunny_storage_service.queue_upload(
+                    local_path=video_file_url,
+                    title=new_video.title,
+                    metadata={
+                        'video_id': new_video.id,
+                        'user_id': active_recording.user_id,
+                        'court_id': court_id,
+                        'recording_id': active_recording.recording_id,
+                        'duration': duration_minutes
+                    }
+                )
+                
+                if upload_id:
+                    logger.info(f"✅ Upload Bunny programmé avec ID: {upload_id}")
+                else:
+                    logger.warning(f"⚠️ Échec programmation upload Bunny")
+                    
+            except Exception as bunny_error:
+                logger.warning(f"⚠️ Erreur upload Bunny CDN: {bunny_error}")
         
         # Log de l'action d'arrêt par le club
         try:
@@ -1471,3 +1583,54 @@ def stop_court_recording(court_id):
         db.session.rollback()
         print(f"Erreur lors de l'arrêt de l'enregistrement: {e}")
         return jsonify({'error': 'Erreur lors de l\'arrêt de l\'enregistrement'}), 500
+
+
+@clubs_bp.route('/cleanup-expired-sessions', methods=['POST'])
+def cleanup_expired_sessions():
+    """Nettoie les sessions d'enregistrement expirées pour libérer les terrains"""
+    try:
+        # Vérifier l'authentification (club ou admin)
+        user = get_current_user()
+        if not user:
+            return jsonify({'error': 'Non authentifié'}), 401
+        
+        if user.role not in [UserRole.CLUB, UserRole.SUPER_ADMIN]:
+            return jsonify({'error': 'Permissions insuffisantes'}), 403
+        
+        # Trouver toutes les sessions actives
+        active_sessions = RecordingSession.query.filter_by(status='active').all()
+        
+        cleaned_count = 0
+        sessions_info = []
+        
+        for session in active_sessions:
+            if session.is_expired():
+                # Marquer la session comme terminée
+                session.status = 'completed'
+                cleaned_count += 1
+                
+                # Collecter les informations pour le rapport
+                court = Court.query.get(session.court_id)
+                sessions_info.append({
+                    'session_id': session.id,
+                    'court_id': session.court_id,
+                    'court_name': court.name if court else f'Court {session.court_id}',
+                    'user_id': session.user_id,
+                    'expired_since': session.get_expired_duration_minutes()
+                })
+        
+        if cleaned_count > 0:
+            db.session.commit()
+            logger.info(f"Nettoyage automatique: {cleaned_count} sessions expirées supprimées")
+        
+        return jsonify({
+            'success': True,
+            'message': f'{cleaned_count} session(s) expirée(s) nettoyée(s)',
+            'cleaned_sessions': sessions_info,
+            'total_cleaned': cleaned_count
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Erreur lors du nettoyage des sessions: {e}")
+        return jsonify({'error': 'Erreur lors du nettoyage'}), 500

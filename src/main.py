@@ -3,24 +3,36 @@ Fichier principal de l'application PadelVar
 Factory pattern pour créer l'instance Flask
 """
 import os
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash
 from flask_migrate import Migrate
 
 # Importations relatives corrigées
-from .config import config
+from .config import DevelopmentConfig, ProductionConfig, Config
 from .models.database import db
 from .models.user import User, UserRole
 from .routes.auth import auth_bp
 from .routes.admin import admin_bp
-from .routes.videos import videos_bp
+from .routes.videos import videos_bp  # Réactivé pour les vidéos
 from .routes.clubs import clubs_bp
 from .routes.frontend import frontend_bp
 from .routes.all_clubs import all_clubs_bp
+# from .routes.payment import payment_bp  # Temporarily disabled due to blocking imports
+from .routes.system import system_bp
+
+# Configuration des environnements
+config = {
+    'development': DevelopmentConfig,
+    'production': ProductionConfig,
+    'default': DevelopmentConfig
+}
 from .routes.players import players_bp
-from .routes.recording import recording_bp
+from .routes.recording import recording_bp  # Réactivé pour les terrains
+# from .routes.recording_v2 import recording_bp as recording_v2_bp  # Temporarily disabled
+# from .routes.recording_new import recording_api, init_recording_service  # Temporarily disabled
 from .routes.password_reset_routes import password_reset_bp
+from .routes.diagnostic import diagnostic_bp
 
 def create_app(config_name=None):
     """
@@ -76,13 +88,22 @@ def create_app(config_name=None):
     # Enregistrement des blueprints
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(admin_bp, url_prefix='/api/admin')
-    app.register_blueprint(videos_bp, url_prefix='/api/videos')
+    app.register_blueprint(videos_bp, url_prefix='/api/videos')  # Réactivé pour les vidéos
     app.register_blueprint(clubs_bp, url_prefix='/api/clubs')
-    app.register_blueprint(frontend_bp)
     app.register_blueprint(all_clubs_bp, url_prefix='/api/all-clubs')
     app.register_blueprint(players_bp, url_prefix='/api/players')
     app.register_blueprint(recording_bp, url_prefix='/api/recording')
+    # app.register_blueprint(recording_v2_bp, url_prefix='/api/recording/v2')  # Temporarily disabled
+    # app.register_blueprint(recording_api, url_prefix='/api/recording/v3')  # Temporarily disabled
+    app.register_blueprint(diagnostic_bp, url_prefix='/api/diagnostic')
+    # app.register_blueprint(payment_bp, url_prefix='/api/payment')  # Temporarily disabled
+    app.register_blueprint(system_bp, url_prefix='/api/system')
     app.register_blueprint(password_reset_bp)
+    # Frontend blueprint en dernier pour éviter d'intercepter les routes API
+    app.register_blueprint(frontend_bp)
+    
+    # Initialiser le nouveau service d'enregistrement
+    # init_recording_service(app)  # Temporarily disabled
     
     # Route de test pour le développement
     if config_name == 'development':
@@ -113,6 +134,8 @@ def create_app(config_name=None):
             'environment': config_name
         }
     
+
+    
     @app.route('/')
     def index():
         """Page d'accueil de l'API"""
@@ -138,6 +161,13 @@ def create_app(config_name=None):
             
             # Créer l'admin par défaut s'il n'existe pas
             _create_default_admin(app)
+            
+            # Démarrer le monitoring périodique en développement
+            _init_periodic_monitoring(app)
+    elif config_name == 'production':
+        # En production, s'assurer que le monitoring est actif
+        with app.app_context():
+            _init_periodic_monitoring(app)
     
     return app
 
@@ -213,3 +243,54 @@ def create_admin(app, email, password, name="Admin"):
         print(f"✅ Administrateur créé: {email}")
         return True
 
+def _init_periodic_monitoring(app):
+    """
+    Initialise le monitoring périodique du système
+    
+    Args:
+        app: Instance Flask
+    """
+    try:
+        # Importer et démarrer le monitoring seulement si Celery est disponible
+        from .tasks.maintenance_tasks import system_monitoring_check
+        
+        # Exécuter une vérification immédiate au démarrage
+        with app.app_context():
+            result = system_monitoring_check.delay()
+            print(f"✅ Monitoring système initialisé")
+            
+    except ImportError:
+        print(f"⚠️  Celery non disponible, monitoring périodique désactivé")
+    except Exception as e:
+        print(f"⚠️  Erreur lors de l'initialisation du monitoring: {e}")
+
+    # ===== INTÉGRATION API CAMÉRA OPTIMISÉE =====
+    
+    # Routes caméra optimisées pour Axis IP
+    from src.routes.camera_api import camera_bp
+    app.register_blueprint(camera_bp, url_prefix='/api/camera')
+    
+    # Test rapide de la caméra Axis au démarrage
+    @app.route('/api/test-axis-camera', methods=['GET'])
+    def test_axis_camera():
+        """Test rapide de votre caméra Axis"""
+        try:
+            from src.services.camera_capture_service import camera_capture
+            from datetime import datetime
+            
+            axis_camera_url = "http://212.231.225.55:88/axis-cgi/mjpg/video.cgi"
+            success, message = camera_capture.test_camera_connection(
+                axis_camera_url, timeout=15
+            )
+            
+            return jsonify({
+                'camera_url': axis_camera_url,
+                'success': success,
+                'message': message,
+                'timestamp': datetime.now().isoformat()
+            }), 200
+            
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    # ===== FIN INTÉGRATION API CAMÉRA =====

@@ -1,7 +1,12 @@
 """
-Services de l'application PadelVar
+Services de l'application PadelVar - Système MJPEG modernisé
 """
 
-from .video_capture_service import video_capture_service
+from .video_recording_service import video_recording_service
+from .mjpeg_recorder import MJPEGToBunnyRecorder, UploadMonitor
 
-__all__ = ['video_capture_service']
+__all__ = [
+    'video_recording_service',
+    'MJPEGToBunnyRecorder', 
+    'UploadMonitor'
+]

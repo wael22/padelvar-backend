@@ -1,6 +1,6 @@
 """
-Service pour le stockage et la distribution de vidéos avec Bunny Stream CDN
-Gère l'upload des fichiers vidéo vers Bunny Stream via l'API HTTP au lieu du FTP
+Service optimisé pour le stockage et la distribution de vidéos avec Bunny Stream CDN
+Gère l'upload robuste des fichiers vidéo avec retry automatique et gestion d'erreurs améliorée
 """
 
 import os
@@ -8,314 +8,512 @@ import logging
 import threading
 import time
 import json
-from datetime import datetime
-from typing import Optional, Dict, Any, Tuple
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Tuple, List
 import requests
 from pathlib import Path
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
 # Configuration du logger
 logger = logging.getLogger(__name__)
 
-class BunnyStorageService:
-    """Service de gestion du stockage vidéo sur Bunny Stream CDN"""
-    
-    # Configuration Bunny Stream API
-    API_KEY = "dea74bd3-cb95-40f6-8b25e0cb6901-c108-4bf1"  # Clé API visible sur la capture d'écran
-    LIBRARY_ID = "475694"  # ID de la bibliothèque visible sur la capture d'écran
-    API_BASE_URL = f"https://video.bunnycdn.com/library/{LIBRARY_ID}"
-    CDN_HOSTNAME = "vz-f2c97d0e-5d4.b-cdn.net"  # Hostname visible sur la capture d'écran
+
+class BunnyStorageConfig:
+    """Configuration centralisée pour Bunny Storage"""
     
     def __init__(self):
-        """Initialise le service de stockage Bunny Stream"""
-        self.upload_queue = []
-        self.is_uploading = False
-        self.upload_thread = None
-        self.lock = threading.RLock()
+        self.api_key = os.environ.get('BUNNY_API_KEY', 'afa3157a-ca54-4125-99445bf2e95d-3eaa-446c')
+        self.library_id = os.environ.get('BUNNY_LIBRARY_ID', '483557')
+        self.cdn_hostname = os.environ.get('BUNNY_CDN_HOSTNAME', 'vz-295cd743-fd2.b-cdn.net')
         
-        # Configuration des headers API
+        # URLs API
+        self.api_base_url = f"https://video.bunnycdn.com/library/{self.library_id}"
+        
+        # Headers API
         self.headers = {
-            "AccessKey": self.API_KEY,
+            "AccessKey": self.api_key,
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-    
-    def get_video_url(self, video_id: str) -> str:
-        """
-        Génère l'URL de visionnage pour une vidéo stockée sur Bunny Stream CDN.
         
-        Args:
-            video_id: ID de la vidéo sur Bunny Stream
-            
-        Returns:
-            URL complète de la vidéo
-        """
-        # Format Bunny Stream CDN: https://<cdn_hostname>/<video_id>/play.mp4
-        return f"https://{self.CDN_HOSTNAME}/{video_id}/play.mp4"
+        # Configuration avancée
+        self.chunk_size = 8 * 1024 * 1024  # 8MB chunks pour upload
+        self.max_retries = 3
+        self.retry_delay = 5  # secondes
+        self.timeout = 300  # 5 minutes
+        self.max_concurrent_uploads = 2
     
-    def upload_file(self, local_path: str, title: Optional[str] = None, collection: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[str]]:
-        """
-        Upload un fichier vers Bunny Stream via l'API HTTP.
+    def is_valid(self) -> bool:
+        """Vérifie si la configuration est valide"""
+        return (
+            bool(self.api_key) and 
+            len(self.api_key) > 10 and
+            bool(self.library_id) and 
+            self.library_id.isdigit() and
+            bool(self.cdn_hostname) and 
+            '.' in self.cdn_hostname
+        )
+
+
+class UploadStatus:
+    """États possibles d'un upload"""
+    PENDING = 'pending'
+    UPLOADING = 'uploading' 
+    PROCESSING = 'processing'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+    RETRYING = 'retrying'
+
+
+class UploadTask:
+    """Tâche d'upload avec métadonnées"""
+    
+    def __init__(self, local_path: str, title: str = None, metadata: Dict = None):
+        self.id = f"upload_{int(time.time())}_{hashlib.md5(local_path.encode()).hexdigest()[:8]}"
+        self.local_path = local_path
+        self.title = title or Path(local_path).stem
+        self.metadata = metadata or {}
         
-        Args:
-            local_path: Chemin local du fichier à uploader
-            title: Titre de la vidéo
-            collection: Collection à laquelle ajouter la vidéo
-            
-        Returns:
-            Tuple (success, video_id, video_url)
-        """
-        try:
-            if not os.path.exists(local_path):
-                logger.error(f"Fichier non trouvé: {local_path}")
-                return False, None, None
-            
-            # Si le titre n'est pas spécifié, utiliser le nom du fichier local
-            if title is None:
-                title = os.path.basename(local_path)
+        self.status = UploadStatus.PENDING
+        self.retries = 0
+        self.created_at = datetime.now()
+        self.started_at = None
+        self.completed_at = None
+        
+        self.bunny_video_id = None
+        self.bunny_url = None
+        self.error_message = None
+        
+        # Pour suivi de progression
+        self.bytes_uploaded = 0
+        self.total_bytes = 0
+        
+        # Lock pour thread safety
+        self._lock = threading.Lock()
+    
+    def update_status(self, status: str, error: str = None):
+        """Met à jour le statut de manière thread-safe"""
+        with self._lock:
+            self.status = status
+            if error:
+                self.error_message = error
+            if status == UploadStatus.UPLOADING and not self.started_at:
+                self.started_at = datetime.now()
+            elif status == UploadStatus.COMPLETED:
+                self.completed_at = datetime.now()
+    
+    def increment_retry(self):
+        """Incrémente le compteur de retry"""
+        with self._lock:
+            self.retries += 1
+    
+    def get_file_size(self) -> int:
+        """Retourne la taille du fichier"""
+        if not hasattr(self, '_file_size'):
+            try:
+                self._file_size = Path(self.local_path).stat().st_size
+            except:
+                self._file_size = 0
+        return self._file_size
+
+
+class BunnyStorageService:
+    """Service de gestion du stockage vidéo sur Bunny Stream CDN optimisé"""
+    
+    def __init__(self):
+        """Initialise le service de stockage Bunny Stream"""
+        self.config = BunnyStorageConfig()
+        
+        if not self.config.is_valid():
+            logger.error("❌ Configuration Bunny CDN invalide")
+            raise ValueError("Configuration Bunny CDN invalide")
+        
+        # Queue et workers
+        self.upload_queue = Queue()
+        self.active_uploads: Dict[str, UploadTask] = {}
+        self.completed_uploads: Dict[str, UploadTask] = {}
+        
+        # Thread management
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.config.max_concurrent_uploads,
+            thread_name_prefix="BunnyUpload"
+        )
+        self.is_running = True
+        self._lock = threading.RLock()
+        
+        # Statistiques
+        self.stats = {
+            'uploads_started': 0,
+            'uploads_completed': 0,
+            'uploads_failed': 0,
+            'bytes_uploaded': 0
+        }
+        
+        # Démarrer le worker
+        self._start_workers()
+        
+        logger.info(f"✅ Service Bunny Storage initialisé (Library: {self.config.library_id})")
+    
+    def _start_workers(self):
+        """Démarre les workers d'upload"""
+        for i in range(self.config.max_concurrent_uploads):
+            self.executor.submit(self._upload_worker, f"worker_{i}")
+    
+    def _upload_worker(self, worker_name: str):
+        """Worker qui traite les uploads en continu"""
+        logger.info(f"🚀 Worker {worker_name} démarré")
+        
+        while self.is_running:
+            try:
+                # Récupérer la prochaine tâche (timeout pour permettre shutdown)
+                task = self.upload_queue.get(timeout=5)
                 
-            # 1. Créer la vidéo sur Bunny Stream
-            logger.info(f"Création de la vidéo sur Bunny Stream: {title}")
-            create_data = {
-                "title": title,
-                "collectionId": collection
-            }
+                if task is None:  # Signal d'arrêt
+                    break
+                
+                logger.info(f"📤 {worker_name} commence upload: {task.title}")
+                self._process_upload(task, worker_name)
+                
+                self.upload_queue.task_done()
+                
+            except Empty:
+                continue  # Timeout normal, continuer
+            except Exception as e:
+                logger.error(f"❌ Erreur worker {worker_name}: {e}")
+                time.sleep(1)
+    
+    def _process_upload(self, task: UploadTask, worker_name: str):
+        """Traite un upload individuel avec retry automatique"""
+        
+        with self._lock:
+            self.active_uploads[task.id] = task
+            self.stats['uploads_started'] += 1
+        
+        success = False
+        
+        while task.retries <= self.config.max_retries and not success:
+            try:
+                if task.retries > 0:
+                    task.update_status(UploadStatus.RETRYING)
+                    delay = self.config.retry_delay * (2 ** task.retries)  # Backoff exponentiel
+                    logger.info(f"⏳ Retry {task.retries}/{self.config.max_retries} dans {delay}s: {task.title}")
+                    time.sleep(delay)
+                
+                task.update_status(UploadStatus.UPLOADING)
+                success = self._upload_file_to_bunny(task, worker_name)
+                
+                if success:
+                    task.update_status(UploadStatus.COMPLETED)
+                    logger.info(f"✅ Upload réussi: {task.title} -> {task.bunny_url}")
+                    
+                    with self._lock:
+                        self.stats['uploads_completed'] += 1
+                        self.stats['bytes_uploaded'] += task.get_file_size()
+                    
+                    # Mettre à jour la base de données si nécessaire
+                    self._update_database(task)
+                    
+                else:
+                    task.increment_retry()
+                    
+            except Exception as e:
+                logger.error(f"❌ Erreur upload {task.title}: {e}")
+                task.update_status(UploadStatus.FAILED, str(e))
+                task.increment_retry()
+        
+        if not success:
+            task.update_status(UploadStatus.FAILED, f"Échec après {self.config.max_retries} tentatives")
+            logger.error(f"❌ Upload définitivement échoué: {task.title}")
             
-            response = requests.post(
-                f"{self.API_BASE_URL}/videos",
-                headers=self.headers,
-                json=create_data
+            with self._lock:
+                self.stats['uploads_failed'] += 1
+        
+        # Déplacer vers completed
+        with self._lock:
+            if task.id in self.active_uploads:
+                del self.active_uploads[task.id]
+            self.completed_uploads[task.id] = task
+    
+    def _upload_file_to_bunny(self, task: UploadTask, worker_name: str) -> bool:
+        """Upload effectif vers Bunny CDN avec gestion des chunks"""
+        
+        try:
+            # Vérifier que le fichier existe
+            if not Path(task.local_path).exists():
+                task.error_message = "Fichier introuvable"
+                return False
+            
+            task.total_bytes = task.get_file_size()
+            
+            # 1. Créer la vidéo sur Bunny Stream
+            logger.debug(f"📝 {worker_name}: Création vidéo Bunny: {task.title}")
+            
+            create_response = requests.post(
+                f"{self.config.api_base_url}/videos",
+                headers=self.config.headers,
+                json={"title": task.title},
+                timeout=30
             )
             
-            if response.status_code != 200:
-                logger.error(f"Erreur lors de la création de la vidéo: {response.text}")
-                return False, None, None
-                
-            video_data = response.json()
-            video_id = video_data.get("guid")
+            if create_response.status_code not in [200, 201]:
+                task.error_message = f"Erreur création: {create_response.status_code} - {create_response.text}"
+                return False
             
-            if not video_id:
-                logger.error(f"Pas d'ID de vidéo dans la réponse: {video_data}")
-                return False, None, None
-                
-            logger.info(f"Vidéo créée avec l'ID: {video_id}")
+            video_data = create_response.json()
+            task.bunny_video_id = video_data.get("guid")
             
-            # 2. Upload le fichier vidéo
-            upload_url = f"{self.API_BASE_URL}/videos/{video_id}"
+            if not task.bunny_video_id:
+                task.error_message = "Pas d'ID vidéo retourné"
+                return False
             
-            with open(local_path, 'rb') as file:
-                logger.info(f"Upload de {local_path} vers Bunny Stream...")
-                upload_headers = {
-                    "AccessKey": self.API_KEY,
-                    "Content-Type": "application/octet-stream"
-                }
-                
+            # 2. Upload du fichier
+            logger.debug(f"📤 {worker_name}: Upload fichier {task.local_path}")
+            
+            upload_headers = {
+                "AccessKey": self.config.api_key,
+                "Content-Type": "application/octet-stream"
+            }
+            
+            upload_url = f"{self.config.api_base_url}/videos/{task.bunny_video_id}"
+            
+            with open(task.local_path, 'rb') as file:
+                # Upload avec monitoring de progression
                 upload_response = requests.put(
                     upload_url,
                     headers=upload_headers,
-                    data=file
+                    data=self._file_iterator(file, task),
+                    timeout=self.config.timeout
+                )
+            
+            if upload_response.status_code not in [200, 201, 204]:
+                task.error_message = f"Erreur upload: {upload_response.status_code} - {upload_response.text}"
+                return False
+            
+            # 3. Générer l'URL finale
+            task.bunny_url = f"https://{self.config.cdn_hostname}/{task.bunny_video_id}/play.mp4"
+            
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            task.error_message = f"Erreur réseau: {str(e)}"
+            return False
+        except Exception as e:
+            task.error_message = f"Erreur inattendue: {str(e)}"
+            return False
+    
+    def _file_iterator(self, file, task: UploadTask):
+        """Itérateur de fichier avec suivi de progression"""
+        while True:
+            chunk = file.read(self.config.chunk_size)
+            if not chunk:
+                break
+            
+            task.bytes_uploaded += len(chunk)
+            
+            # Log de progression (tous les 10MB)
+            if task.bytes_uploaded % (10 * 1024 * 1024) == 0:
+                progress = (task.bytes_uploaded / task.total_bytes) * 100
+                logger.debug(f"📊 Upload {task.title}: {progress:.1f}%")
+            
+            yield chunk
+    
+    def _update_database(self, task: UploadTask):
+        """Met à jour la base de données avec l'URL Bunny - Version corrigée"""
+        if 'video_id' not in task.metadata:
+            logger.warning("⚠️ video_id manquant dans metadata - création nouvelle vidéo")
+            return self._create_new_video_record(task)
+        
+        try:
+            # Import local pour éviter les dépendances circulaires
+            import sys
+            sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+            
+            from flask import Flask
+            from models.database import db
+            from models.user import Video
+            
+            # Créer un contexte d'application minimal
+            app = Flask(__name__)
+            app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
+            app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+            
+            db.init_app(app)
+            
+            with app.app_context():
+                video_id = task.metadata['video_id']
+                
+                # CORRECTION: Vérifier si video_id est valide avant la requête
+                if not video_id or video_id == 'None' or video_id is None:
+                    logger.warning("⚠️ video_id est None - création nouvelle vidéo")
+                    return self._create_new_video_record(task)
+                
+                try:
+                    video = Video.query.get(video_id)
+                    
+                    if video:
+                        video.file_url = task.bunny_url
+                        video.bunny_video_id = task.bunny_video_id
+                        video.status = "completed"
+                        video.uploaded_at = datetime.utcnow()
+                        db.session.commit()
+                        logger.info(f"✅ URL vidéo {video_id} mise à jour: {task.bunny_url}")
+                    else:
+                        logger.warning(f"⚠️ Vidéo {video_id} non trouvée en BDD - création nouvelle")
+                        return self._create_new_video_record(task)
+                        
+                except Exception as db_error:
+                    logger.error(f"❌ Erreur requête BDD: {db_error}")
+                    return self._create_new_video_record(task)
+                    
+        except Exception as e:
+            logger.error(f"❌ Erreur mise à jour BDD: {e}")
+            return self._create_new_video_record(task)
+    
+    def _create_new_video_record(self, task: UploadTask):
+        """Crée un nouvel enregistrement vidéo quand video_id est NULL ou invalide"""
+        try:
+            logger.info("🆕 Création nouveau record vidéo en BDD")
+            
+            # Import local
+            import sys
+            sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+            
+            from flask import Flask
+            from models.database import db
+            from models.user import Video
+            
+            app = Flask(__name__)
+            app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
+            app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+            
+            db.init_app(app)
+            
+            with app.app_context():
+                # Générer titre basé sur filename
+                filename = os.path.basename(task.local_path)
+                title = filename.replace('.mp4', '').replace('_', ' ').title()
+                
+                new_video = Video(
+                    title=title,
+                    description=f"Enregistrement automatique - {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
+                    file_url=task.bunny_url,
+                    user_id=task.metadata.get('user_id', 1),
+                    court_id=task.metadata.get('court_id', 1),
+                    duration=task.metadata.get('duration', 0),
+                    file_size=os.path.getsize(task.local_path) if os.path.exists(task.local_path) else 0,
+                    recorded_at=datetime.utcnow(),
+                    created_at=datetime.utcnow()
                 )
                 
-                if upload_response.status_code != 200:
-                    logger.error(f"Erreur lors de l'upload du fichier: {upload_response.text}")
-                    return False, video_id, None
-            
-            # 3. Attendre que la vidéo soit traitée
-            logger.info(f"Upload réussi, vidéo en cours de traitement: {video_id}")
-            
-            # Générer l'URL de la vidéo
-            video_url = self.get_video_url(video_id)
-            
-            logger.info(f"Upload terminé avec succès! URL: {video_url}")
-            return True, video_id, video_url
+                db.session.add(new_video)
+                db.session.commit()
                 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Erreur API lors de l'upload de {local_path}: {str(e)}")
-            return False, None, None
+                logger.info(f"✅ Nouvelle vidéo créée: ID={new_video.id}, URL={new_video.file_url}")
+                
+                return {
+                    'success': True,
+                    'video_id': new_video.id,
+                    'url': new_video.file_url
+                }
+                
         except Exception as e:
-            logger.error(f"Erreur inattendue lors de l'upload de {local_path}: {str(e)}")
-            return False, None, None
+            logger.error(f"❌ Erreur création nouveau record: {e}")
+            return {'success': False, 'error': str(e)}
     
-    def queue_upload(self, local_path: str, title: Optional[str] = None, collection: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> str:
+    # API publique
+    
+    def queue_upload(self, local_path: str, title: str = None, metadata: Dict = None) -> str:
         """
         Ajoute un fichier à la queue d'upload.
         
         Args:
-            local_path: Chemin local du fichier à uploader
-            title: Titre de la vidéo (utilise le nom du fichier par défaut)
-            collection: Collection à laquelle ajouter la vidéo
-            metadata: Métadonnées associées à l'upload (id vidéo, etc.)
-            
-        Returns:
-            ID de l'upload dans la queue
-        """
-        if title is None:
-            title = os.path.basename(local_path)
-        
-        upload_id = f"upload_{len(self.upload_queue) + 1}_{int(time.time())}"
-        
-        with self.lock:
-            self.upload_queue.append({
-                'id': upload_id,
-                'local_path': local_path,
-                'title': title,
-                'collection': collection,
-                'metadata': metadata or {},
-                'status': 'pending',
-                'retries': 0,
-                'timestamp': datetime.now()
-            })
-            
-            # Démarrer le thread d'upload si pas déjà en cours
-            if not self.is_uploading:
-                self.start_upload_thread()
-        
-        return upload_id
-    
-    def start_upload_thread(self):
-        """Démarre un thread d'upload pour traiter la queue en arrière-plan"""
-        with self.lock:
-            if self.is_uploading:
-                return
-            
-            self.is_uploading = True
-            self.upload_thread = threading.Thread(target=self._process_upload_queue)
-            self.upload_thread.daemon = True
-            self.upload_thread.start()
-    
-    def _process_upload_queue(self):
-        """Traitement de la queue d'upload en arrière-plan"""
-        try:
-            # Importer les modules nécessaires ici pour éviter les imports circulaires
-            import time
-            from flask import current_app
-            from ..models.database import db
-            from ..models.user import Video
-            
-            while True:
-                # Récupérer le prochain fichier à uploader
-                upload_item = None
-                with self.lock:
-                    pending_uploads = [item for item in self.upload_queue if item['status'] == 'pending']
-                    if not pending_uploads:
-                        self.is_uploading = False
-                        break
-                    
-                    upload_item = pending_uploads[0]
-                    upload_item['status'] = 'uploading'
-                
-                # Vérifier que le fichier existe
-                if not os.path.exists(upload_item['local_path']):
-                    logger.error(f"❌ Fichier non trouvé pour l'upload: {upload_item['local_path']}")
-                    with self.lock:
-                        upload_item['status'] = 'failed'
-                    time.sleep(1)
-                    continue
-                    
-                # Uploader le fichier
-                logger.info(f"🔄 Upload du fichier {upload_item['local_path']} vers Bunny Stream en cours...")
-                success, bunny_video_id, bunny_url = self.upload_file(
-                    upload_item['local_path'], 
-                    upload_item['title'],
-                    upload_item.get('collection')
-                )
-                
-                # Mettre à jour le statut
-                with self.lock:
-                    if success and bunny_video_id and bunny_url:
-                        upload_item['status'] = 'completed'
-                        upload_item['bunny_video_id'] = bunny_video_id
-                        upload_item['bunny_url'] = bunny_url
-                        logger.info(f"✅ Upload réussi: {upload_item['title']} -> ID: {bunny_video_id}")
-                        
-                        # Mettre à jour les métadonnées si nécessaire (URL de la vidéo, etc.)
-                        if 'video_id' in upload_item['metadata']:
-                            try:
-                                # Créer une application Flask temporaire pour le contexte
-                                from src import create_app
-                                app = create_app()
-                                with app.app_context():
-                                    video_id = upload_item['metadata']['video_id']
-                                    video = Video.query.get(video_id)
-                                    if video:
-                                        # Mettre à jour l'URL du fichier pour utiliser Bunny Stream
-                                        video.file_url = bunny_url
-                                        db.session.commit()
-                                        logger.info(f"✅ URL de la vidéo {video_id} mise à jour avec succès: {bunny_url}")
-                            except Exception as e:
-                                logger.error(f"❌ Erreur lors de la mise à jour de la vidéo dans la BDD: {str(e)}")
-                    else:
-                        upload_item['retries'] += 1
-                        if upload_item['retries'] >= 3:
-                            upload_item['status'] = 'failed'
-                            logger.error(f"❌ Upload échoué après 3 tentatives: {upload_item['local_path']}")
-                        else:
-                            upload_item['status'] = 'pending'
-                            logger.warning(f"⚠️ Tentative {upload_item['retries']}/3 échouée pour {upload_item['local_path']}")
-                
-                # Pause entre les uploads pour éviter de surcharger le serveur
-                time.sleep(3)  # Augmenté pour Bunny Stream qui peut avoir des limites d'API
-                
-        except Exception as e:
-            logger.error(f"❌ Erreur dans le thread d'upload: {str(e)}")
-            with self.lock:
-                self.is_uploading = False
-
-    def upload_video_immediately(self, video_id, local_path, remote_filename=None):
-        """
-        Upload une vidéo immédiatement via Bunny Stream API et met à jour la base de données.
-        Utile pour les migrations ou les uploads manuels.
-        
-        Args:
-            video_id: ID de la vidéo dans la base de données
             local_path: Chemin local du fichier
-            remote_filename: Nom du fichier distant (utilisé comme titre si spécifié)
+            title: Titre de la vidéo
+            metadata: Métadonnées (ex: video_id pour BDD)
         
         Returns:
-            Tuple (success, url) avec le statut et l'URL si succès
+            ID de la tâche d'upload
         """
-        try:
-            # Vérifier que le fichier existe
-            if not os.path.exists(local_path):
-                logger.error(f"❌ Fichier non trouvé: {local_path}")
-                return False, None
-            
-            # Déterminer le titre de la vidéo pour Bunny Stream
-            title = remote_filename if remote_filename else f"Video {video_id}"
-            
-            # Upload vers Bunny Stream
-            logger.info(f"🔄 Upload immédiat de {local_path} vers Bunny Stream avec titre: {title}")
-            success, bunny_video_id, bunny_url = self.upload_file(local_path, title, collection=f"video_{video_id}")
-            
-            if success and bunny_video_id and bunny_url:
-                logger.info(f"✅ Upload immédiat réussi: {bunny_url} (ID: {bunny_video_id})")
-                
-                try:
-                    # Mettre à jour la base de données
-                    from src import create_app
-                    from ..models.database import db
-                    from ..models.user import Video
-                    
-                    app = create_app()
-                    with app.app_context():
-                        video = Video.query.get(video_id)
-                        if video:
-                            video.file_url = bunny_url
-                            db.session.commit()
-                            logger.info(f"✅ URL de la vidéo {video_id} mise à jour avec succès")
-                        else:
-                            logger.warning(f"⚠️ Vidéo {video_id} non trouvée dans la base de données")
-                except Exception as e:
-                    logger.error(f"❌ Erreur lors de la mise à jour de la base de données: {str(e)}")
-                
-                return True, bunny_url
-            else:
-                logger.error(f"❌ Échec de l'upload immédiat pour {local_path}")
-                return False, None
-                
-        except Exception as e:
-            logger.error(f"❌ Erreur lors de l'upload immédiat: {str(e)}")
-            return False, None
+        
+        if not Path(local_path).exists():
+            raise FileNotFoundError(f"Fichier introuvable: {local_path}")
+        
+        task = UploadTask(local_path, title, metadata)
+        self.upload_queue.put(task)
+        
+        logger.info(f"📋 Tâche ajoutée à la queue: {task.title} (ID: {task.id})")
+        return task.id
+    
+    def upload_immediately(self, local_path: str, title: str = None) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Upload synchrone immédiat d'un fichier.
+        
+        Returns:
+            Tuple (success, video_id, video_url)
+        """
+        task = UploadTask(local_path, title)
+        
+        if self._upload_file_to_bunny(task, "immediate"):
+            return True, task.bunny_video_id, task.bunny_url
+        else:
+            return False, None, task.error_message
+    
+    def get_upload_status(self, upload_id: str) -> Optional[Dict[str, Any]]:
+        """Retourne le statut d'un upload"""
+        
+        # Chercher dans les uploads actifs
+        if upload_id in self.active_uploads:
+            task = self.active_uploads[upload_id]
+        elif upload_id in self.completed_uploads:
+            task = self.completed_uploads[upload_id]
+        else:
+            return None
+        
+        progress = 0
+        if task.total_bytes > 0:
+            progress = (task.bytes_uploaded / task.total_bytes) * 100
+        
+        return {
+            'id': task.id,
+            'status': task.status,
+            'title': task.title,
+            'progress': progress,
+            'retries': task.retries,
+            'bunny_video_id': task.bunny_video_id,
+            'bunny_url': task.bunny_url,
+            'error_message': task.error_message,
+            'created_at': task.created_at.isoformat(),
+            'started_at': task.started_at.isoformat() if task.started_at else None,
+            'completed_at': task.completed_at.isoformat() if task.completed_at else None
+        }
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques du service"""
+        with self._lock:
+            return {
+                **self.stats,
+                'active_uploads': len(self.active_uploads),
+                'queue_size': self.upload_queue.qsize(),
+                'completed_uploads': len(self.completed_uploads)
+            }
+    
+    def shutdown(self):
+        """Arrête proprement le service"""
+        logger.info("🛑 Arrêt du service Bunny Storage...")
+        
+        self.is_running = False
+        
+        # Arrêter les workers
+        for _ in range(self.config.max_concurrent_uploads):
+            self.upload_queue.put(None)  # Signal d'arrêt
+        
+        # Attendre la fin des uploads en cours
+        self.executor.shutdown(wait=True)
+        
+        logger.info("✅ Service Bunny Storage arrêté")
 
 
-# Créer une instance globale du service
+# Instance globale du service
 bunny_storage_service = BunnyStorageService()
