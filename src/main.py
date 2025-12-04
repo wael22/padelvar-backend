@@ -29,6 +29,8 @@ config = {
 }
 from .routes.players import players_bp
 from .routes.recording import recording_bp  # Réactivé pour les terrains
+from .routes.video import video_bp  # 🆕 Nouveau système vidéo stable
+from .routes.video_preview import preview_bp  # 🆕 Preview vidéo temps réel
 # from .routes.recording_v2 import recording_bp as recording_v2_bp  # Temporarily disabled
 # from .routes.recording_new import recording_api, init_recording_service  # Temporarily disabled
 from .routes.password_reset_routes import password_reset_bp
@@ -93,6 +95,8 @@ def create_app(config_name=None):
     app.register_blueprint(all_clubs_bp, url_prefix='/api/all-clubs')
     app.register_blueprint(players_bp, url_prefix='/api/players')
     app.register_blueprint(recording_bp, url_prefix='/api/recording')
+    app.register_blueprint(video_bp)  # 🆕 Système vidéo stable (prefix inclus dans blueprint)
+    app.register_blueprint(preview_bp)  # 🆕 Preview vidéo temps réel (prefix inclus dans blueprint)
     # app.register_blueprint(recording_v2_bp, url_prefix='/api/recording/v2')  # Temporarily disabled
     # app.register_blueprint(recording_api, url_prefix='/api/recording/v3')  # Temporarily disabled
     app.register_blueprint(diagnostic_bp, url_prefix='/api/diagnostic')

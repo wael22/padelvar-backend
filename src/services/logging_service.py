@@ -73,8 +73,8 @@ class SystemLogger:
             self.logger.addHandler(file_handler)
             self.logger.addHandler(console_handler)
         
-        # Monitoring système
-        self.monitoring_active = True
+        # Monitoring système (désactivé en développement)
+        self.monitoring_active = False
         self.system_metrics = {}
         self.problems_detected = []
         self.monitoring_thread = None

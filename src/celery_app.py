@@ -115,7 +115,7 @@ def create_celery_app(app=None):
     return celery
 
 # Instance globale Celery
-celery_app = create_celery_app()
+celery_app = None  # Désactivé en dev
 
 # Fonction pour initialiser avec Flask app
 def init_celery(app):

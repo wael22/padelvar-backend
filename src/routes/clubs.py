@@ -1431,39 +1431,52 @@ def stop_court_recording(court_id):
             duration_minutes = 1
             print(f"  Fallback: durée fixée à 1 minute")
         
-        # Arrêter l'enregistrement vidéo physique
-        from src.services.video_capture_service_ultimate import DirectVideoCaptureService
-        video_capture_service = DirectVideoCaptureService()
+        
+        # 🆕 Arrêter l'enregistrement vidéo via NOUVEAU système
+        from src.video_system.session_manager import session_manager
+        from src.video_system.recording import video_recorder
         
         try:
-            # Arrêter le processus d'enregistrement et finaliser le fichier
-            stop_result = video_capture_service.stop_recording(active_recording.recording_id)
-            logger.info(f"Arrêt enregistrement: {stop_result}")
+            # Arrêter enregistrement FFmpeg
+            video_file_path = video_recorder.stop_recording(active_recording.recording_id)
+            logger.info(f"Arrêt enregistrement via nouveau système: {video_file_path}")
+            
+            # Fermer session proxy
+            # CRITIQUE: Marquer comme inactif AVANT de fermer
+            session = session_manager.get_session(active_recording.recording_id)
+            if session:
+                session.recording_active = False
+            session_manager.close_session(active_recording.recording_id)
+            
+            # Le fichier est dans static/videos/{club_id}/{session_id}.mp4
+            if video_file_path:
+                video_file_url = f"videos/{court.club_id}/{active_recording.recording_id}.mp4"
+            else:
+                video_file_url = None
+                
         except Exception as e:
             logger.warning(f"Erreur lors de l'arrêt du service vidéo: {e}")
-            stop_result = False
-        
+            video_file_url = None
+                
         # Créer automatiquement une vidéo pour le joueur
         video_title = active_recording.title or f"Match du {active_recording.start_time.strftime('%d/%m/%Y')} - {court.name}"
         
         # Déterminer l'URL du fichier vidéo
         video_file_url = None
-        if stop_result:  # Le service renvoie True si succès
-            # Chercher le fichier dans le dossier standard
-            expected_file = f"static/videos/{active_recording.recording_id}.mp4"
-            if os.path.exists(expected_file):
-                video_file_url = expected_file
-                logger.info(f"Fichier vidéo trouvé: {expected_file}")
+        # video_file_url déjà défini plus haut (ligne ~1449)
+        # Vérifier que le fichier existe
+        if not video_file_url or not os.path.exists(video_file_url):
+            possible_paths = [
+                f"static/videos/{court.club_id}/{active_recording.recording_id}.mp4",
+                f"static/videos/{active_recording.recording_id}.mp4"
+            ]
+            for path in possible_paths:
+                if os.path.exists(path):
+                    video_file_url = path
+                    logger.info(f"Fichier vidéo trouvé: {path}")
+                    break
             else:
-                logger.warning(f"Fichier vidéo non trouvé: {expected_file}")
-        else:
-            # Fallback : chercher le fichier même si l'arrêt a échoué
-            expected_file = f"static/videos/{active_recording.recording_id}.mp4"
-            if os.path.exists(expected_file):
-                video_file_url = expected_file
-                logger.info(f"Fichier vidéo trouvé en fallback: {expected_file}")
-            else:
-                logger.warning(f"Fichier vidéo non trouvé: {expected_file}")
+                logger.warning(f"Fichier vidéo introuvable pour {active_recording.recording_id}")
         
         new_video = Video(
             title=video_title,
@@ -1487,7 +1500,10 @@ def stop_court_recording(court_id):
                 time.sleep(2)
                 
                 # Utiliser ffprobe pour obtenir la durée réelle
-                ffprobe_result = video_capture_service._get_video_duration_ffprobe(video_file_url)
+                # Utiliser FFmpegRunner
+                from src.services.ffmpeg_runner import FFmpegRunner
+                runner = FFmpegRunner()
+                ffprobe_result = runner.probe_video_info(video_file_url)
                 
                 if ffprobe_result:
                     real_duration_seconds = ffprobe_result['duration']

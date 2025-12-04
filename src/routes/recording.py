@@ -15,12 +15,13 @@ from ..models.user import (
     User, Club, Court, Video, RecordingSession, 
     ClubActionHistory, UserRole
 )
-from ..services.video_capture_service_ultimate import (
-    DirectVideoCaptureService
-)
+# from ..services.video_capture_service_ultimate import (
+#     DirectVideoCaptureService
+# )
 
 # Instance globale du service
-video_capture_service = DirectVideoCaptureService()
+# video_capture_service = DirectVideoCaptureService()
+
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,6 @@ def cleanup_expired_sessions(club_id=None):
 # ====================================================================
 
 @recording_bp.route('/start', methods=['POST'])
-@recording_bp.route('/v3/start', methods=['POST'])  # Nouvelle route v3 pour compatibilité frontend
 def start_recording_with_duration():
     """Démarrer un enregistrement avec durée sélectionnable"""
     user = get_current_user()
@@ -115,11 +115,8 @@ def start_recording_with_duration():
         # Nettoyer les sessions expirées pour ce club avant de vérifier la disponibilité
         cleanup_expired_sessions(court.club_id)
         
-        if court.is_recording:
-            return jsonify({
-                'error': 'Ce terrain est déjà utilisé pour un enregistrement',
-                'current_recording_id': court.current_recording_id
-            }), 409
+        # Note: La vérification de disponibilité du terrain est gérée par RecordingSession
+        # L'ancien système utilisait court.is_recording qui n'existe plus
         
         # Vérifier que l'utilisateur a des crédits
         if user.credits_balance < 1:
@@ -160,11 +157,10 @@ def start_recording_with_duration():
             status='active'
         )
         
-        # Réserver le terrain
-        court.is_recording = True
-        court.current_recording_id = recording_id
+        # Note: Le terrain est réservé via RecordingSession status='active'
+        # L'ancien système utilisait court.is_recording qui n'existe plus
         
-        # Débiter un crédit
+        #Débiter un crédit
         user.credits_balance -= 1
         
         # Ajouter tous les objets à la session
@@ -187,43 +183,6 @@ def start_recording_with_duration():
         db.session.commit()
         
         logger.info(f"Enregistrement démarré: {recording_id} sur terrain {court_id}")
-        
-        # ✨ DÉMARRER LA CAPTURE VIDÉO RÉELLE avec FFmpeg
-        try:
-            # Construire les paramètres pour la capture vidéo
-            # Correspondance terrain → caméra
-            camera_mapping = {
-                1: "http://212.231.225.55:88/axis-cgi/mjpg/video.cgi",  # Terrain 1 - Axis
-                2: "http://212.231.225.55:88/axis-cgi/mjpg/video.cgi",  # Terrain 2 - Axis
-                4: "http://213.3.30.80:6001/mjpg/video.mjpg",          # Terrain 3 - MJPG
-                5: "http://213.3.30.80:6001/mjpg/video.mjpg"           # Terrain 4 - MJPG
-            }
-            
-            camera_url = camera_mapping.get(court_id, camera_mapping[1])  # Fallback Terrain 1
-            logger.info(f"🎥 Terrain {court_id} → Caméra: {camera_url}")
-            
-            output_path = f"static/videos/{recording_id}.mp4"
-            max_duration = planned_duration * 60  # Convertir en secondes
-            
-            capture_success = video_capture_service.start_recording(
-                session_id=recording_id,
-                camera_url=camera_url,
-                output_path=output_path,
-                max_duration=max_duration,
-                user_id=user.id,
-                court_id=court_id,
-                session_name=title or f'Match du {datetime.now().strftime("%d/%m/%Y %H:%M")}'
-            )
-            
-            if capture_success:
-                logger.info(f"✅ Capture vidéo démarrée avec succès pour {recording_id}")
-            else:
-                logger.warning(f"⚠️ Erreur démarrage capture vidéo pour {recording_id}")
-                # Ne pas bloquer l'enregistrement, mais noter l'erreur
-                
-        except Exception as capture_error:
-            logger.error(f"❌ Erreur critique capture vidéo {recording_id}: {capture_error}")
-            # Ne pas annuler l'enregistrement, la DB est déjà commitée
         
         # Préparer la réponse après le commit réussi
         response_data = {
@@ -322,11 +281,9 @@ def _stop_recording_session(recording_session, stopped_by, performed_by_id):
         recording_session.stopped_by = stopped_by
         recording_session.end_time = datetime.utcnow()
         
-        # Libérer le terrain
+        # Note: Le terrain est libéré via RecordingSession status='stopped'
+        # L'ancien système utilisait court.is_recording qui n'existe plus
         court = Court.query.get(recording_session.court_id)
-        if court:
-            court.is_recording = False
-            court.current_recording_id = None
         
         # Créer la vidéo
         elapsed_minutes = recording_session.get_elapsed_minutes()
@@ -337,50 +294,13 @@ def _stop_recording_session(recording_session, stopped_by, performed_by_id):
         logger.info(f"   📅 End time: {recording_session.end_time}")
         logger.info(f"   ⏱️ Durée calculée DB: {elapsed_minutes:.2f} minutes = {elapsed_minutes * 60:.0f} secondes")
         
-        # �🔍 VÉRIFICATION DURÉE RÉELLE avec ffprobe (CORRECTION CRITIQUE)
-        video_file_path = f"static/videos/{recording_session.recording_id}.mp4"
-        real_duration_seconds = None
-        
-        logger.info(f"🔍 Vérification fichier vidéo: {video_file_path}")
-        
-        if os.path.exists(video_file_path):
-            file_size = os.path.getsize(video_file_path)
-            logger.info(f"📁 Fichier trouvé: {file_size:,} bytes")
-            
-            try:
-                # Utiliser le service pour obtenir la durée réelle du fichier vidéo
-                logger.info("🔍 Lecture durée réelle avec ffprobe...")
-                real_duration_seconds = video_capture_service._get_video_duration_accurate(video_file_path)
-                
-                if real_duration_seconds:
-                    real_duration_minutes = real_duration_seconds / 60
-                    difference_seconds = abs(real_duration_seconds - (elapsed_minutes * 60))
-                    difference_minutes = difference_seconds / 60
-                    
-                    logger.info(f"📊 COMPARAISON DURÉES:")
-                    logger.info(f"   🗄️ DB (start-end): {elapsed_minutes:.2f} min = {elapsed_minutes * 60:.0f}s")
-                    logger.info(f"   🎥 Fichier réel:   {real_duration_minutes:.2f} min = {real_duration_seconds:.0f}s")
-                    logger.info(f"   📈 Différence:     {difference_minutes:.2f} min = {difference_seconds:.0f}s")
-                    
-                    if difference_seconds > 10:  # Différence significative
-                        logger.warning(f"⚠️ ÉCART IMPORTANT détecté: {difference_seconds:.0f}s d'écart!")
-                        logger.warning("🔧 Utilisation durée réelle du fichier (correction appliquée)")
-                    else:
-                        logger.info("✅ Durées cohérentes - fichier et DB correspondent")
-                else:
-                    logger.warning("⚠️ Impossible de lire durée réelle - utilisation durée DB")
-            except Exception as e:
-                logger.error(f"❌ Erreur lecture durée réelle: {e}")
-        else:
-            logger.warning(f"⚠️ Fichier vidéo non trouvé: {video_file_path}")
-        
-        # Utiliser durée réelle si disponible, sinon fallback sur durée DB
-        final_duration = real_duration_seconds if real_duration_seconds else (elapsed_minutes * 60)
+        # Use elapsed time from database as duration
+        final_duration = elapsed_minutes * 60
         
         # 📊 LOGS DÉTAILLÉS - Résultat final
         logger.info(f"🎯 DURÉE FINALE RETENUE:")
         logger.info(f"   💾 Stockage en DB: {final_duration:.0f} secondes = {final_duration/60:.2f} minutes")
-        logger.info(f"   🔄 Source: {'📹 Fichier réel (ffprobe)' if real_duration_seconds else '🗄️ Calcul DB (fallback)'}")
+        # Source: Calcul DB (temps start → end)
         
         video = Video(
             user_id=recording_session.user_id,
@@ -407,70 +327,6 @@ def _stop_recording_session(recording_session, stopped_by, performed_by_id):
         )
         
         db.session.commit()
-        
-        # ✨ ARRÊTER LA CAPTURE VIDÉO RÉELLE
-        try:
-            stop_success = video_capture_service.stop_recording(recording_session.recording_id)
-            
-            if stop_success:
-                logger.info(f"✅ Capture vidéo arrêtée avec succès pour {recording_session.recording_id}")
-            else:
-                logger.warning(f"⚠️ Erreur arrêt capture vidéo pour {recording_session.recording_id}")
-                
-        except Exception as capture_error:
-            logger.error(f"❌ Erreur critique arrêt capture {recording_session.recording_id}: {capture_error}")
-        
-        # 🚀 UPLOAD AUTOMATIQUE VERS BUNNY CDN
-        try:
-            from ..services.bunny_storage_service import bunny_storage_service
-            
-            # Chemin du fichier vidéo local
-            video_file_path = f"static/videos/{recording_session.recording_id}.mp4"
-            
-            if os.path.exists(video_file_path):
-                # 🔧 RÉPARATION AUTOMATIQUE MP4 avant upload (CORRECTION CRITIQUE)
-                logger.info(f"🔧 Vérification/réparation MP4 avant upload...")
-                
-                try:
-                    # Utiliser la fonction de réparation du service vidéo
-                    repair_success = video_capture_service._repair_video_metadata(video_file_path)
-                    if repair_success:
-                        logger.info("✅ MP4 réparé/validé - prêt pour upload")
-                        # Re-vérifier la durée après réparation
-                        repaired_duration = video_capture_service._get_video_duration_accurate(video_file_path)
-                        if repaired_duration and repaired_duration != final_duration:
-                            logger.info(f"📊 Durée mise à jour après réparation: {repaired_duration}s")
-                            video.duration = repaired_duration
-                            db.session.commit()
-                    else:
-                        logger.warning("⚠️ Réparation MP4 échouée - upload du fichier original")
-                except Exception as repair_error:
-                    logger.error(f"❌ Erreur réparation MP4: {repair_error}")
-                
-                logger.info(f"📤 Démarrage upload Bunny pour {recording_session.recording_id}")
-                
-                # Upload immédiat vers Bunny
-                success, video_id, stream_url = bunny_storage_service.upload_immediately(
-                    local_path=video_file_path,
-                    title=recording_session.title or f"Enregistrement automatique - {court.name if court else 'Terrain'}"
-                )
-                
-                if success and stream_url:
-                    # Mettre à jour l'URL de la vidéo avec l'URL Bunny
-                    video.file_url = stream_url
-                    video.bunny_video_id = video_id
-                    db.session.commit()
-                    
-                    logger.info(f"✅ Upload Bunny réussi pour {recording_session.recording_id}")
-                    logger.info(f"🎬 URL de streaming: {stream_url}")
-                else:
-                    logger.warning(f"⚠️ Échec upload Bunny pour {recording_session.recording_id}")
-            else:
-                logger.warning(f"📁 Fichier vidéo non trouvé: {video_file_path}")
-                
-        except Exception as bunny_error:
-            logger.error(f"❌ Erreur upload Bunny {recording_session.recording_id}: {bunny_error}")
-            # Ne pas faire échouer l'arrêt d'enregistrement pour autant
         
         logger.info(f"Enregistrement arrêté: {recording_session.recording_id} par {stopped_by}")
         
@@ -601,24 +457,6 @@ def get_available_courts(club_id):
         for court in courts:
             court_data = court.to_dict()
             print(f"📍 Terrain '{court.name}' (ID: {court.id}) - Disponible: {court_data['available']}")
-            
-            # Si le terrain est en cours d'enregistrement, ajouter les détails
-            if court.is_recording and court.current_recording_id:
-                recording_session = RecordingSession.query.filter_by(
-                    recording_id=court.current_recording_id,
-                    status='active'
-                ).first()
-                
-                if recording_session and not recording_session.is_expired():
-                    player = User.query.get(recording_session.user_id)
-                    court_data['recording_info'] = {
-                        'player_name': player.name if player else 'Inconnu',
-                        'start_time': recording_session.start_time.isoformat(),
-                        'planned_duration': recording_session.planned_duration,
-                        'elapsed_minutes': recording_session.get_elapsed_minutes(),
-                        'remaining_minutes': recording_session.get_remaining_minutes()
-                    }
-            
             courts_data.append(court_data)
         
         print(f"✅ Réponse API: {len(courts_data)} terrains retournés")
@@ -667,3 +505,369 @@ def cleanup_expired_recordings():
     except Exception as e:
         logger.error(f"Erreur lors du nettoyage: {e}")
         return jsonify({'error': 'Erreur lors du nettoyage'}), 500
+
+# ====================================================================
+# V3 RECORDING API - Uses recording_manager_v2 for actual video capture
+# ====================================================================
+
+@recording_bp.route('/v3/health', methods=['GET'])
+def recording_v3_health():
+    """Health check for recording system v3"""
+    try:
+        from src.services.recording_manager_v2 import get_recording_manager
+        from src.services.video_proxy_manager_v2 import get_proxy_manager
+        from src.recording_config.recording_config import config
+        
+        recording_manager = get_recording_manager()
+        proxy_manager = get_proxy_manager()
+        
+        # Check FFmpeg
+        ffmpeg_ok = config.validate_ffmpeg()
+        
+        # Check disk space
+        disk_ok = config.has_sufficient_disk_space()
+        disk_gb = config.get_available_disk_space() / (1024**3)
+        
+        # Get active recordings
+        active_recordings = recording_manager.get_all_active()
+        
+        health_status = {
+            'status': 'healthy' if (ffmpeg_ok and disk_ok) else 'degraded',
+            'ffmpeg_available': ffmpeg_ok,
+            'ffmpeg_path': config.FFMPEG_PATH,
+            'disk_space_ok': disk_ok,
+            'disk_space_gb': round(disk_gb, 2),
+            'active_recordings_count': len(active_recordings),
+            'max_concurrent': config.MAX_CONCURRENT_RECORDINGS,
+            'proxy_count': len(proxy_manager.proxies)
+        }
+        
+        return jsonify(health_status), 200
+        
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@recording_bp.route('/v3/test', methods=['GET'])
+def recording_v3_test():
+    """Test endpoint for v3 recording system"""
+    return jsonify({
+        'message': 'Recording V3 API is working',
+        'version': '3.0',
+        'endpoints': {
+            'start': '/api/recording/v3/start',
+            'stop': '/api/recording/v3/stop',
+            'status': '/api/recording/v3/status/<recording_id>',
+            'active': '/api/recording/v3/active',
+            'health': '/api/recording/v3/health',
+            'diagnostics': '/api/recording/v3/diagnostics/<recording_id>'
+        }
+    }), 200
+
+
+@recording_bp.route('/v3/start', methods=['POST'])
+def start_recording_v3():
+    """🆕 ADAPTATEUR: Redirige vers le nouveau système vidéo stable"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    try:
+        # 🆕 Utiliser le NOUVEAU système vidéo stable
+        from src.video_system.session_manager import session_manager
+        from src.video_system.recording import video_recorder
+        
+        data = request.get_json()
+        court_id = data.get('court_id')
+        duration_minutes = data.get('duration_minutes', 90)
+        
+        if not court_id:
+            return jsonify({'error': 'court_id requis'}), 400
+        
+        # Get court
+        court = Court.query.get(court_id)
+        if not court:
+            return jsonify({'error': 'Terrain non trouvé'}), 404
+        
+        if not court.camera_url:
+            return jsonify({'error': f'Caméra non configurée pour le terrain {court_id}'}), 400
+        
+        logger.info(f"🎬 V3 Adapter: Nouvelle demande d'enregistrement - Terrain {court_id}")
+        
+        # 1. Créer session caméra
+        try:
+            session = session_manager.create_session(
+                terrain_id=court_id,
+                camera_url=court.camera_url,
+                club_id=court.club_id,
+                user_id=user.id
+            )
+            logger.info(f"✅ Session créée: {session.session_id}")
+        except Exception as e:
+            logger.error(f"❌ Erreur création session: {e}", exc_info=True)
+            return jsonify({
+                'success': False,
+                'error': f'Erreur création session: {str(e)}'
+            }), 500
+        
+        # 2. Démarrer enregistrement
+        try:
+            success = video_recorder.start_recording(
+                session=session,
+                duration_seconds=duration_minutes * 60
+            )
+            
+            if not success:
+                session_manager.close_session(session.session_id)
+                return jsonify({
+                    'success': False,
+                    'error': 'Échec démarrage enregistrement'
+                }), 500
+            
+            # 3. 🆕 Mettre à jour l'état du terrain dans la DB
+            from src.models.database import db
+            from src.models.user import RecordingSession
+            from datetime import datetime
+            
+            try:
+                # Créer une entrée RecordingSession pour le suivi
+                recording_session = RecordingSession(
+                    recording_id=session.session_id,
+                    court_id=court_id,
+                    user_id=user.id,
+                    club_id=court.club_id,
+                    planned_duration=duration_minutes,
+                    status='active',
+                    title=f'Enregistrement {court.name}'
+                )
+                db.session.add(recording_session)
+                
+                # Marquer le terrain comme occupé
+                court.is_recording = True
+                
+                db.session.commit()
+                logger.info(f"📊 État terrain mis à jour: {court.name} → En enregistrement")
+                
+            except Exception as db_err:
+                logger.error(f"⚠️ Erreur mise à jour DB: {db_err}")
+                # Continue quand même, l'enregistrement fonctionne
+                db.session.rollback()
+            
+            logger.info(f"✅ Enregistrement démarré via nouveau système: {session.session_id}")
+            
+            # Retourner format compatible avec l'ancien système
+            return jsonify({
+                'success': True,
+                'message': 'Enregistrement démarré',
+                'recording_id': session.session_id,
+                'recording_info': {
+                    'session_id': session.session_id,
+                    'terrain_id': court_id,
+                    'duration_seconds': duration_minutes * 60
+                }
+            }), 201
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur démarrage enregistrement: {e}", exc_info=True)
+            session_manager.close_session(session.session_id)
+            return jsonify({
+                'success': False,
+                'error': f'Erreur enregistrement: {str(e)}'
+            }), 500
+        
+    except Exception as e:
+        logger.error(f"Error in v3 adapter: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': f'Erreur: {str(e)}'
+        }), 500
+
+
+@recording_bp.route('/v3/stop', methods=['POST'])
+def stop_recording_v3():
+    """Stop recording using recording_manager_v2"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Non authentifié'}), 401
+    
+    try:
+        from src.services.recording_manager_v2 import get_recording_manager
+        
+        data = request.get_json()
+        recording_id = data.get('recording_id')
+        
+        if not recording_id:
+            return jsonify({'error': 'recording_id requis'}), 400
+        
+        recording_manager = get_recording_manager()
+        
+        success, message = recording_manager.stop_recording(
+            recording_id=recording_id,
+            reason='manual'
+        )
+        
+        if not success:
+            return jsonify({
+                'success': False,
+                'error': message
+            }), 500
+        
+        # Get final recording info
+        recording_info = recording_manager.get_recording_info(recording_id)
+        
+        response = {
+            'success': True,
+            'message': message,
+            'recording_id': recording_id
+        }
+        
+        if recording_info:
+            response['final_video_path'] = recording_info.get('final_video_path')
+            response['status'] = recording_info.get('status')
+            
+            # Calculate file size if video exists
+            final_path = recording_info.get('final_video_path')
+            if final_path and os.path.exists(final_path):
+                file_size = os.path.getsize(final_path)
+                response['file_size_mb'] = file_size / (1024**2)
+        
+        logger.info(f"✅ V3 Recording stopped: {recording_id}")
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        logger.error(f"Error stopping v3 recording: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': f'Erreur: {str(e)}'
+        }), 500
+
+
+@recording_bp.route('/v3/status/<recording_id>', methods=['GET'])
+def get_recording_status_v3(recording_id):
+    """Get status of a recording"""
+    try:
+        from src.services.recording_manager_v2 import get_recording_manager
+        
+        recording_manager = get_recording_manager()
+        recording_info = recording_manager.get_recording_info(recording_id)
+        
+        if not recording_info:
+            return jsonify({'error': 'Enregistrement non trouvé'}), 404
+        
+        # Calculate elapsed time
+        start_time = datetime.fromisoformat(recording_info['start_time'])
+        elapsed_seconds = (datetime.now() - start_time).total_seconds()
+        
+        response = {
+            'recording_id': recording_id,
+            'status': recording_info.get('status'),
+            'elapsed_seconds': int(elapsed_seconds),
+            'duration_seconds': recording_info.get('duration_seconds'),
+            'start_time': recording_info.get('start_time'),
+            'expected_end_time': recording_info.get('expected_end_time'),
+            'segments_written': recording_info.get('segments_written', []),
+            'final_video_path': recording_info.get('final_video_path'),
+            'errors': recording_info.get('errors', [])
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting recording status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@recording_bp.route('/v3/active', methods=['GET'])
+def get_active_recordings_v3():
+    """Get all active recordings"""
+    try:
+        from src.services.recording_manager_v2 import get_recording_manager
+        
+        recording_manager = get_recording_manager()
+        active_recordings = recording_manager.get_all_active()
+        
+        return jsonify(active_recordings), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting active recordings: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@recording_bp.route('/v3/diagnostics/<recording_id>', methods=['GET'])
+def get_recording_diagnostics_v3(recording_id):
+    """Get detailed diagnostics for a recording"""
+    try:
+        from src.services.recording_manager_v2 import get_recording_manager
+        
+        recording_manager = get_recording_manager()
+        recording_info = recording_manager.get_recording_info(recording_id)
+        
+        if not recording_info:
+            return jsonify({'error': 'Enregistrement non trouvé'}), 404
+        
+        # Enhanced diagnostics
+        diagnostics = recording_info.copy()
+        
+        # Add file system info
+        tmp_dir = recording_info.get('tmp_dir')
+        if tmp_dir and os.path.exists(tmp_dir):
+            tmp_files = os.listdir(tmp_dir)
+            diagnostics['tmp_files'] = tmp_files
+            diagnostics['tmp_file_count'] = len(tmp_files)
+        
+        final_path = recording_info.get('final_video_path')
+        if final_path and os.path.exists(final_path):
+            file_size = os.path.getsize(final_path)
+            diagnostics['final_file_size_mb'] = file_size / (1024**2)
+            diagnostics['final_file_exists'] = True
+        else:
+            diagnostics['final_file_exists'] = False
+        
+        return jsonify(diagnostics), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting diagnostics: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@recording_bp.route('/v3/stream/<int:terrain_id>', methods=['GET'])
+def get_stream_url_v3(terrain_id):
+    """Get the streaming URL for a terrain's camera"""
+    try:
+        from src.services.video_proxy_manager_v2 import get_proxy_manager
+        
+        # Get court
+        court = Court.query.get(terrain_id)
+        if not court:
+            return jsonify({'error': 'Terrain non trouvé'}), 404
+        
+        proxy_manager = get_proxy_manager()
+        
+        # Check if proxy is running
+        proxy_info = proxy_manager.get_proxy_info(terrain_id)
+        
+        if not proxy_info:
+            # Proxy not running, return camera URL and suggest starting it
+            return jsonify({
+                'terrain_id': terrain_id,
+                'camera_url': court.camera_url,
+                'proxy_active': False,
+                'message': 'Proxy non démarré. Démarrez un enregistrement pour activer le proxy.'
+            }), 200
+        
+        return jsonify({
+            'terrain_id': terrain_id,
+            'camera_url': court.camera_url,
+            'proxy_url': proxy_info.get('proxy_url'),
+            'proxy_active': True,
+            'proxy_port': proxy_info.get('port')
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting stream URL: {e}")
+        return jsonify({'error': str(e)}), 500
